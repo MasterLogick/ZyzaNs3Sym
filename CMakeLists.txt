@@ -80,7 +80,7 @@ option(
 )
 set(NS3_OUTPUT_DIRECTORY "" CACHE STRING "Directory to store built artifacts")
 option(NS3_PRECOMPILE_HEADERS
-       "Precompile module headers to speed up compilation" ON
+       "Precompile module headers to speed up compilation" OFF
 )
 option(NS3_PYTHON_BINDINGS "Build ns-3 python bindings" OFF)
 option(NS3_SQLITE "Build with SQLite support" ON)
@@ -91,9 +91,9 @@ option(NS3_STATIC "Build a static ns-3 library and link it against executables"
 option(NS3_VCPKG "Enable the Vcpkg C++ library manager support" OFF)
 option(NS3_VERBOSE "Print additional build system messages" OFF)
 option(NS3_VISUALIZER "Build visualizer module" ON)
-option(NS3_WARNINGS "Enable compiler warnings" ON)
+option(NS3_WARNINGS "Enable compiler warnings" OFF)
 option(NS3_WARNINGS_AS_ERRORS
-       "Treat warnings as errors. Requires NS3_WARNINGS=ON" ON
+       "Treat warnings as errors. Requires NS3_WARNINGS=ON" OFF
 )
 
 # Options that either select which modules will get built or disable modules
