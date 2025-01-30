@@ -1,14 +1,16 @@
 #ifndef ZYZZYVA_A_ZYZAREPLICA_H
 #define ZYZZYVA_A_ZYZAREPLICA_H
 
+#include "../../src/point-to-point-layout/model/point-to-point-star.h"
 #include "Endpoint.h"
+#include "FallbackRequestState.h"
 #include "MessageHeader.h"
+#include "ZyzaCommon.h"
 #include "lib/zyza.capnp.h"
 
 #include "ns3/applications-module.h"
 #include "ns3/internet-module.h"
 #include "ns3/network-module.h"
-#include "../../src/point-to-point-layout/model/point-to-point-star.h"
 
 #include <capnp/message.h>
 #include <chrono>
@@ -20,19 +22,17 @@
 
 namespace zyza
 {
-class ZyzaReplica : public Endpoint, public ns3::Application
+class ZyzaReplica : public Endpoint, public ZyzaCommon, public ns3::Application
 {
   public:
     ZyzaReplica(int nodesCount,
                 int idx,
-                //                int port,
-//                ns3::NodeContainer& nodes,
                 ns3::PointToPointStarHelper& p2psh,
-                //                std::vector<std::pair<std::string, uint16_t>>& nodeList,
                 std::vector<std::vector<uint8_t>>& serializedPublicKeys,
-                std::span<const uint8_t> privateKey);
+                std::span<const uint8_t> privateKey,
+                std::chrono::milliseconds fallbackTimeout);
 
-    ~ZyzaReplica() noexcept override{};
+    ~ZyzaReplica() noexcept override {};
 
   private:
     void StartApplication() override;
@@ -45,13 +45,31 @@ class ZyzaReplica : public Endpoint, public ns3::Application
     void onMessage(std::span<const uint8_t> message) override;
 
   private:
-    void processRequest(std::unique_ptr<capnp::MallocMessageBuilder> reader);
+    void startNewRound();
 
-    void processProposal(proto::Proposal::Reader reader);
+    void processRequest(const proto::Request::Reader& reader);
 
-    void processAcknowledgement(proto::Acknowledgement::Reader reader);
+    void processProposal(const proto::Proposal::Reader& proposal);
 
-    void processQuorumCertificate(capnp::MessageBuilder& builder);
+    void processAcknowledgement(const proto::Acknowledgement::Reader& ack);
+
+    void processQuorumCertificate(const proto::QuorumCertificate::Reader& qc);
+
+    void processFallbackAlert(const proto::FallbackAlert::Reader& fallbackAlert);
+
+    void processQuorumDropResponse(const proto::QuorumDropResponse::Reader& quorumDropResponse);
+
+    void processRecovery(const proto::Recovery::Reader& recovery);
+
+    void processNetworkStatusRequest(const proto::NetworkStatusRequest::Reader& nsr);
+
+    void processNetworkStatusResponse(const proto::NetworkStatusResponse::Reader& nsr);
+
+    void processResendChainRequest(const proto::ResendChainRequest::Reader& nsr);
+
+    void processResendChainResponse(const proto::ResendChainResponse::Reader& nsr);
+
+    void recoverWithProposal(const proto::Proposal::Reader& proposal);
 
     void sendToClient(const std::string& dstIp,
                       uint16_t dstPort,
@@ -62,40 +80,75 @@ class ZyzaReplica : public Endpoint, public ns3::Application
 
     void restartConnectionToNode(int i);
 
+    void responseToClient(const proto::Request::Reader& request);
+
+    void sendPendingNodeMessages(int i);
+
+    void resendChainPart(
+        std::list<std::pair<uint8_t[32], capnp::MallocMessageBuilder>>::iterator it,
+        int idx,
+        int partSize);
+
+    void sendDropRequests();
+
+    void broadcastRecovery();
+
+    void switchToFallback();
+
+    void sendNetworkStatusRequest();
+
+    void startLeaderZeroNode();
+
+    bool signData(const uint8_t* data, size_t size, uint8_t* result);
+
+    bool signData(const uint8_t* hash, uint8_t* result);
+
+    bool validateData(const capnp::Data::Reader& data, const proto::Signature::Reader& signature);
+
+    bool validateData(const uint8_t* hash, const uint8_t* sign, int signer);
+
+    bool validateQuorumCertificate(const proto::QuorumCertificate::Reader& reader,
+                                   uint8_t* expectedResponseProposalHash);
+
     bool isLeader() const;
 
-    int nodesCount;
-    int quorumSize;
     int idx;
-    int currentLeader;
-
-    //    std::vector<std::shared_ptr<uvw::tcp_handle>> activeNodeConnections;
-    std::vector<ns3::Ptr<ns3::Socket>> activeNodeConnections;
-    //    std::vector<std::pair<std::string, uint16_t>>& nodeList;
-
-    std::vector<secp256k1_pubkey> publicKeys;
     uint8_t seckey[32];
-    secp256k1_context* secpCtx;
+    std::chrono::milliseconds fallbackTimeout;
 
-    std::map<int, char[64]> pendingProposalAcks;
-    std::vector<std::unique_ptr<capnp::MallocMessageBuilder>> pendingRequests;
+    std::vector<ns3::Ptr<ns3::Socket>> activeNodeConnections;
+
+    int currentFastPathLeader;
+    int currentBackupPathLeader;
+    std::list<std::pair<uint8_t[32], capnp::MallocMessageBuilder>> chain;
     uint8_t proposalHash[32];
+    std::unique_ptr<capnp::MallocMessageBuilder> pendingProposal;
+    std::map<uint16_t, std::vector<std::pair<std::unique_ptr<char[]>, uint32_t>>>
+        pendingNodeMessages;
+    std::map<int, uint8_t[64]> pendingProposalAcks;
+    std::vector<std::unique_ptr<capnp::MallocMessageBuilder>> pendingRequests;
+    int proposalOrd;
 
-    uint8_t groupHash[32];
-    uint64_t requiredQcReqId;
-    capnp::MallocMessageBuilder lastQuorumCertificate;
-
-    capnp::MallocMessageBuilder initialProposal;
+    std::map<uint64_t, capnp::MallocMessageBuilder> collectedQuorumCertificates;
+    capnp::MallocMessageBuilder lastUnackedProposal;
+    //    std::shared_ptr<uvw::timer_handle> fallbackTimer;
+    ns3::EventId fallbackTimerEvent;
+    bool isInFallbackState;
+    bool sentDropRequests;
+    std::map<int, std::unique_ptr<capnp::MallocMessageBuilder>> acceptedFallbackAlerts;
+    std::map<uint64_t, FallbackRequestState> uniqueRequests;
+    int fallbackClientResponsesCollected;
     bool initPassed;
-    void startNewRound();
+    bool sentNetworkStatusRequest;
+    bool sentResendChainRequest;
 
     ns3::Time last;
     ns3::Time start;
     std::chrono::system_clock::duration sum;
-    int sumCount = 0;
-ns3::PointToPointStarHelper& p2psh;
-//    ns3::NodeContainer& nodes;
-//    std::vector<std::vector<ns3::Ipv4InterfaceContainer>>& interfaces;
+    int sumCount;
+    uint64_t sentStatistics = 0;
+    uint64_t sentMsgSize = 0;
+    ns3::PointToPointStarHelper& p2psh;
 };
 } // namespace zyza
 

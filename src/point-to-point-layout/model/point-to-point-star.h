@@ -125,6 +125,8 @@ class PointToPointStarHelper
      * @param lry lower right y value
      */
     void BoundingBox(double ulx, double uly, double lrx, double lry);
+    const NetDeviceContainer& getMHubDevices() const;
+    const NetDeviceContainer& getMSpokeDevices() const;
 
   private:
     NodeContainer m_hub;                       //!< Hub node

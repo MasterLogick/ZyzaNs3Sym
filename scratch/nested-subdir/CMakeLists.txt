@@ -47,6 +47,9 @@ add_library(zyza STATIC
         lib/Endpoint.cpp
         lib/Endpoint.h
         lib/MessageHeader.h
+        lib/ZyzaCommon.cpp
+        lib/ZyzaCommon.h
+        lib/FallbackRequestState.h
 )
 target_link_libraries(zyza PUBLIC CapnProto::capnp-rpc secp256k1 uvw::uvw-static uv::uv-static OpenSSL::Crypto)
 target_include_directories(zyza PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
@@ -54,10 +57,8 @@ target_include_directories(zyza PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
 # Link the custom library to the scratch executable
 build_exec(
         EXECNAME scratch-zyza-sim
-        SOURCE_FILES main.cc
+        SOURCE_FILES main.cc ZyzaInfiniteClient.cpp
         LIBRARIES_TO_LINK zyza
         ${libcore} ${libinternet} ${libapplications} ${libcsma} ${libpoint-to-point} ${libpoint-to-point-layout}
-        # use "${ns3-libs}" "${ns3-contrib-libs}" in case you want to link to all
-        # enabled modules
         EXECUTABLE_DIRECTORY_PATH ${CMAKE_OUTPUT_DIRECTORY}/scratch/nested-subdir
 )

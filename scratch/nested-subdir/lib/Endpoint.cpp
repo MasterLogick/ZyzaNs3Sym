@@ -1,6 +1,4 @@
 #include "Endpoint.h"
-// #include <uvw/loop.h>
-// #include <uvw/tcp.h>
 
 #include "ns3/internet-module.h"
 
@@ -17,31 +15,70 @@ struct PendingIncomingMessage
 };
 
 Endpoint::Endpoint(ns3::Ptr<ns3::Node> thisNode)
-    : thisNode(thisNode)
+    : thisNode(thisNode),
+      inDestructor(false)
 {
+    lifetimePointer = std::make_shared<int>();
 }
 
 void
 Endpoint::run()
 {
-    auto m_socket = ns3::Socket::CreateSocket(thisNode, ns3::TcpSocketFactory::GetTypeId());
+    serverSocket = ns3::Socket::CreateSocket(thisNode, ns3::TcpSocketFactory::GetTypeId());
     auto l = ns3::InetSocketAddress(ns3::Ipv4Address::GetAny(), 1234);
-    if (m_socket->Bind(l) == -1)
+    if (serverSocket->Bind(l) == -1)
     {
         NS_FATAL_ERROR("Failed to bind socket");
     }
-    m_socket->Listen();
-    m_socket->SetAcceptCallback(
+    serverSocket->Listen();
+    serverSocket->SetAcceptCallback(
         [](auto a, auto& b) { return true; },
-        [this](ns3::Ptr<ns3::Socket> a, auto& b) -> void {
-            auto pim = new PendingIncomingMessage();
-
-            a->SetRecvCallback([this, pim](ns3::Ptr<ns3::Socket> a) -> void {
+        [this, weakPointer = std::weak_ptr<int>(lifetimePointer)](ns3::Ptr<ns3::Socket> a,
+                                                                  auto& b) -> void {
+            auto s = weakPointer.lock();
+            if (s == nullptr)
+            {
+                return;
+            }
+            acceptedSockets.insert(a);
+            a->SetCloseCallbacks(
+                [this, weakPointer = std::weak_ptr<int>(lifetimePointer)](ns3::Ptr<ns3::Socket> a) {
+                    auto s = weakPointer.lock();
+                    if (s == nullptr)
+                    {
+                        return;
+                    }
+                    if (inDestructor)
+                    {
+                        acceptedSockets.erase(a);
+                    }
+                },
+                [this, weakPointer = std::weak_ptr<int>(lifetimePointer)](ns3::Ptr<ns3::Socket> a) {
+                    auto s = weakPointer.lock();
+                    if (s == nullptr)
+                    {
+                        return;
+                    }
+                    if (inDestructor)
+                    {
+                        acceptedSockets.erase(a);
+                    }
+                });
+            auto pim = std::make_shared<PendingIncomingMessage>(0, 0, nullptr);
+            a->SetRecvCallback([this, pim, weakPointer = std::weak_ptr<int>(lifetimePointer)](
+                                   ns3::Ptr<ns3::Socket> a) -> void {
+                auto p = weakPointer.lock();
+                if (p == nullptr)
+                {
+                    return;
+                }
                 while (auto packet = a->Recv())
                 {
                     size_t remainderSize = packet->GetSize();
+                    recvStatistics += remainderSize;
+                    recvMsgSize = remainderSize;
                     auto remainder = std::make_unique<uint8_t[]>(remainderSize);
-                    uint8_t* remainderPtr = remainder.get();
+                    auto* remainderPtr = remainder.get();
                     packet->CopyData(remainderPtr, remainderSize);
                     if (pim->totalSize != 0)
                     {
@@ -51,12 +88,15 @@ Endpoint::run()
                         if (pim->read == pim->totalSize)
                         {
                             onMessage({pim->data.get(), pim->totalSize});
+                            pim->data.reset();
+                            pim->totalSize = 0;
+                            pim->read = 0;
                             remainderPtr += s;
                             remainderSize -= s;
                         }
                         else
                         {
-                            return;
+                            continue;
                         }
                     }
                     while (remainderSize >= 4)
@@ -80,21 +120,16 @@ Endpoint::run()
                 }
             });
         });
-    //    loop = uvw::loop::create();
-    //    serverSocket = loop->resource<uvw::tcp_handle>();
-//    serverSocket->on<uvw::listen_event>([this](const uvw::listen_event&, uvw::tcp_handle& srv) {
-//        std::shared_ptr<uvw::tcp_handle> client = srv.parent().resource<uvw::tcp_handle>();
-//        client->data(std::make_shared<PendingIncomingMessage>(0, 0, nullptr));
-//        client->on<uvw::data_event>([this](const uvw::data_event& event, uvw::tcp_handle& h) {
-//
-//        });
-//        serverSocket->accept(*client);
-//        client->read();
-//    });
-//    serverSocket->bind("0.0.0.0", port);
-//    serverSocket->listen();
-
     onListeningStart();
-//    loop->run();
+}
+
+Endpoint::~Endpoint()
+{
+    inDestructor = true;
+    for (const auto& item : acceptedSockets)
+    {
+        item->Close();
+    }
+    serverSocket->Close();
 }
 } // namespace zyza

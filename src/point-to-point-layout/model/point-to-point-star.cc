@@ -181,4 +181,16 @@ PointToPointStarHelper::BoundingBox(double ulx, double uly, double lrx, double l
     }
 }
 
+const NetDeviceContainer&
+PointToPointStarHelper::getMHubDevices() const
+{
+    return m_hubDevices;
+}
+
+const NetDeviceContainer&
+PointToPointStarHelper::getMSpokeDevices() const
+{
+    return m_spokeDevices;
+}
+
 } // namespace ns3

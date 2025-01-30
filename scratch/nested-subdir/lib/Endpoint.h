@@ -1,11 +1,10 @@
 #ifndef ZYZZYVA_A_LIBZYZA_ENDPOINT_H
 #define ZYZZYVA_A_LIBZYZA_ENDPOINT_H
 
+#include "ns3/network-module.h"
+
 #include <cstdint>
 #include <span>
-// #include <uvw/loop.h>
-// #include <uvw/tcp.h>
-#include "ns3/network-module.h"
 
 namespace zyza
 {
@@ -16,15 +15,21 @@ class Endpoint
 
     void run();
 
+    ~Endpoint();
+
   protected:
     virtual void onListeningStart() = 0;
     virtual void onMessage(std::span<const uint8_t> message) = 0;
 
-    //  std::shared_ptr<uvw::loop> loop;
-    //  std::shared_ptr<uvw::tcp_handle> serverSocket;
+    size_t recvStatistics = 0;
+    size_t recvMsgSize = 0;
 
   private:
     ns3::Ptr<ns3::Node> thisNode;
+    ns3::Ptr<ns3::Socket> serverSocket;
+    std::set<ns3::Ptr<ns3::Socket>> acceptedSockets;
+    bool inDestructor;
+    std::shared_ptr<int> lifetimePointer;
 };
 } // namespace zyza
 
