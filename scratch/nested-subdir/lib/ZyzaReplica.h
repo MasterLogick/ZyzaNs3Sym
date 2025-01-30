@@ -42,7 +42,8 @@ class ZyzaReplica : public Endpoint, public ZyzaCommon, public ns3::Application
 
     void onListeningStart() override;
 
-    void onMessage(std::span<const uint8_t> message) override;
+    void onTcpMessage(std::span<const uint8_t> message) override;
+    void onUdpMessage(std::span<const uint8_t> message) override;
 
   private:
     void startNewRound();

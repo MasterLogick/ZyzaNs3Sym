@@ -51,45 +51,26 @@ ZyzaReplica::sendToClient(const std::string& dstIp,
                           MessageType messageType,
                           std::shared_ptr<capnp::MessageBuilder> message)
 {
-    auto con =
-        ns3::Socket::CreateSocket(p2psh.GetSpokeNode(idx), ns3::TcpSocketFactory::GetTypeId());
-    con->Bind();
+    uint64_t msgId = 0;
+    auto rc = getrandom(&msgId, sizeof(msgId), 0);
+    assert(rc == sizeof(msgId));
+    uint32_t size = capnp::computeSerializedSizeInWords(*message) * 8 + sizeof(MessageHeader);
+    auto data = std::make_unique<uint8_t[]>(size);
+    new (data.get())
+        MessageHeader(size, static_cast<uint16_t>(idx), static_cast<uint16_t>(messageType), msgId);
+    kj::ArrayOutputStream aos({data.get() + sizeof(MessageHeader), size - sizeof(MessageHeader)});
+    capnp::writeMessage(aos, *message);
     ns3::Address sinkAddress(ns3::InetSocketAddress(dstIp.c_str(), dstPort));
-    con->SetConnectCallback(
-        [this, messageType, message](ns3::Ptr<ns3::Socket> h) {
-            uint64_t msgId = 0;
-            auto rc = getrandom(&msgId, sizeof(msgId), 0);
-            assert(rc == sizeof(msgId));
-            uint32_t size =
-                capnp::computeSerializedSizeInWords(*message) * 8 + sizeof(MessageHeader);
-            auto data = std::make_unique<char[]>(size);
-            new (data.get()) MessageHeader(size,
-                                           static_cast<uint16_t>(idx),
-                                           static_cast<uint16_t>(messageType),
-                                           msgId);
-            kj::ArrayOutputStream aos(
-                {reinterpret_cast<uint8_t*>(data.get() + sizeof(MessageHeader)),
-                 size - sizeof(MessageHeader)});
-            capnp::writeMessage(aos, *message);
-            h->SetSendCallback([](ns3::Ptr<ns3::Socket> s, auto) { s->Close(); });
-            h->SetCloseCallbacks([](ns3::Ptr<ns3::Socket> s) { s->Close(); },
-                                 [](ns3::Ptr<ns3::Socket> s) { s->Close(); });
-            std::clog << ns3::Simulator::Now().As() << ": " << idx << ": send message to client"
-                      << std::endl;
-            h->Send(reinterpret_cast<const uint8_t*>(data.get()), size, 0);
-        },
-        [this](auto) -> void {
-            NS_LOG_ERROR(idx << " " << ns3::Simulator::Now().As(ns3::Time::MS)
-                             << " failed to connect to client");
-        });
-    con->Connect(sinkAddress);
+    std::clog << ns3::Simulator::Now().As() << ": " << idx << ": sending message "
+              << messageTypeToString(messageType) << " to client" << std::endl;
+    serverUdpSocket->SendTo(data.get(), size, 0, sinkAddress);
 }
 
 void
 ZyzaReplica::sendToNode(int node, MessageType messageType, capnp::MessageBuilder& message)
 {
     NS_LOG_DEBUG(idx << " " << ns3::Simulator::Now().As(ns3::Time::S) << " sending message "
-                     << (int)messageType << " to " << node);
+                     << messageTypeToString(messageType) << " to " << node);
     auto h = activeNodeConnections[node];
     uint32_t size = capnp::computeSerializedSizeInWords(message) * 8 + sizeof(MessageHeader);
     auto data = std::make_unique<char[]>(size);
@@ -106,7 +87,7 @@ ZyzaReplica::sendToNode(int node, MessageType messageType, capnp::MessageBuilder
         std::clog << ns3::Simulator::Now().As() << ": " << idx << ": sending "
                   << messageTypeToString(messageType) << " to " << node << " msgId: " << std::hex
                   << header->msgId << std::dec << std::endl;
-//        hexdump(data.get(), size);
+        //        hexdump(data.get(), size);
         h->Send(reinterpret_cast<const uint8_t*>(data.get()), size, 0);
     }
     else
@@ -114,7 +95,7 @@ ZyzaReplica::sendToNode(int node, MessageType messageType, capnp::MessageBuilder
         std::clog << ns3::Simulator::Now().As() << ": " << idx << ": adding pending message "
                   << messageTypeToString(messageType) << " to " << node << " msgId: " << std::hex
                   << header->msgId << std::dec << std::endl;
-//        hexdump(data.get(), size);
+        //        hexdump(data.get(), size);
         pendingNodeMessages[node].emplace_back(std::move(data), size);
     }
 }
@@ -169,25 +150,25 @@ ZyzaReplica::sendNetworkStatusRequest()
 }
 
 void
-ZyzaReplica::onMessage(std::span<const uint8_t> message)
+ZyzaReplica::onTcpMessage(std::span<const uint8_t> message)
 {
     auto* header = reinterpret_cast<const MessageHeader*>(message.data());
     auto content = message.subspan<sizeof(MessageHeader)>();
     assert(header->messageSize == message.size());
     auto messageType = static_cast<MessageType>(header->messageType);
+    if (header->senderIdx == 0xffff)
+    {
+        return;
+    }
     std::clog << ns3::Simulator::Now().As() << ": " << idx
               << ": got message: " << messageTypeToString(messageType) << " from "
               << header->senderIdx << " msgId: " << std::hex << header->msgId << std::dec
               << std::endl;
-//    hexdump(message.data(), message.size());
+    //    hexdump(message.data(), message.size());
     capnp::FlatArrayMessageReader reader(
         {reinterpret_cast<const capnp::word*>(content.data()), content.size() / 8});
-    if (messageType == MessageType::REQUEST)
-    {
-        processRequest(reader.getRoot<proto::Request>());
-    }
-    else if (messageType == MessageType::NEXT_ROUND_PROPOSAL && !isLeader() &&
-             header->senderIdx == currentFastPathLeader)
+    if (messageType == MessageType::NEXT_ROUND_PROPOSAL && !isLeader() &&
+        header->senderIdx == currentFastPathLeader)
     {
         processProposal(reader.getRoot<proto::Proposal>());
     }
@@ -195,17 +176,10 @@ ZyzaReplica::onMessage(std::span<const uint8_t> message)
     {
         processAcknowledgement(reader.getRoot<proto::Acknowledgement>());
     }
-    else if (messageType == MessageType::ACCEPT_QUORUM_CERTIFICATE)
-    {
-        processQuorumCertificate(reader.getRoot<proto::QuorumCertificate>());
-    }
+
     else if (messageType == MessageType::FALLBACK_ALERT && !sentDropRequests)
     {
         processFallbackAlert(reader.getRoot<proto::FallbackAlert>());
-    }
-    else if (messageType == MessageType::QUORUM_DROP_RESPONSE && sentDropRequests)
-    {
-        processQuorumDropResponse(reader.getRoot<proto::QuorumDropResponse>());
     }
     else if (messageType == MessageType::RECOVERY && initPassed)
     {
@@ -226,6 +200,38 @@ ZyzaReplica::onMessage(std::span<const uint8_t> message)
     else if (messageType == MessageType::RESEND_CHAIN_RESPONSE)
     {
         processResendChainResponse(reader.getRoot<proto::ResendChainResponse>());
+    }
+}
+
+void
+ZyzaReplica::onUdpMessage(std::span<const uint8_t> message)
+{
+    auto* header = reinterpret_cast<const MessageHeader*>(message.data());
+    auto content = message.subspan<sizeof(MessageHeader)>();
+    assert(header->messageSize == message.size());
+    auto messageType = static_cast<MessageType>(header->messageType);
+    if (header->senderIdx != 0xffff)
+    {
+        return;
+    }
+    std::clog << ns3::Simulator::Now().As() << ": " << idx
+              << ": got message: " << messageTypeToString(messageType) << " from "
+              << header->senderIdx << " msgId: " << std::hex << header->msgId << std::dec
+              << std::endl;
+    //    hexdump(message.data(), message.size());
+    capnp::FlatArrayMessageReader reader(
+        {reinterpret_cast<const capnp::word*>(content.data()), content.size() / 8});
+    if (messageType == MessageType::REQUEST)
+    {
+        processRequest(reader.getRoot<proto::Request>());
+    }
+    else if (messageType == MessageType::ACCEPT_QUORUM_CERTIFICATE)
+    {
+        processQuorumCertificate(reader.getRoot<proto::QuorumCertificate>());
+    }
+    else if (messageType == MessageType::QUORUM_DROP_RESPONSE && sentDropRequests)
+    {
+        processQuorumDropResponse(reader.getRoot<proto::QuorumDropResponse>());
     }
 }
 

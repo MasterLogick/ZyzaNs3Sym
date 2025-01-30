@@ -41,7 +41,10 @@ class ZyzaClientRequest : private Endpoint, private ZyzaCommon
   protected:
     void onListeningStart() override;
 
-    void onMessage(std::span<const uint8_t> message) override;
+    void onTcpMessage(std::span<const uint8_t> message) override;
+
+  private:
+    void onUdpMessage(std::span<const uint8_t> message) override;
 
   private:
     void sendToNode(int node,

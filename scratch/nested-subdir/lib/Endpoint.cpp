@@ -24,14 +24,17 @@ Endpoint::Endpoint(ns3::Ptr<ns3::Node> thisNode)
 void
 Endpoint::run()
 {
-    serverSocket = ns3::Socket::CreateSocket(thisNode, ns3::TcpSocketFactory::GetTypeId());
+    serverTcpSocket = ns3::Socket::CreateSocket(thisNode, ns3::TcpSocketFactory::GetTypeId());
     auto l = ns3::InetSocketAddress(ns3::Ipv4Address::GetAny(), 1234);
-    if (serverSocket->Bind(l) == -1)
+    if (serverTcpSocket->Bind(l) == -1)
     {
         NS_FATAL_ERROR("Failed to bind socket");
     }
-    serverSocket->Listen();
-    serverSocket->SetAcceptCallback(
+    if (serverTcpSocket->Listen() == -1)
+    {
+        NS_FATAL_ERROR("Failed to start listening on socket");
+    }
+    serverTcpSocket->SetAcceptCallback(
         [](auto a, auto& b) { return true; },
         [this, weakPointer = std::weak_ptr<int>(lifetimePointer)](ns3::Ptr<ns3::Socket> a,
                                                                   auto& b) -> void {
@@ -87,7 +90,7 @@ Endpoint::run()
                         pim->read += s;
                         if (pim->read == pim->totalSize)
                         {
-                            onMessage({pim->data.get(), pim->totalSize});
+                            onTcpMessage({pim->data.get(), pim->totalSize});
                             pim->data.reset();
                             pim->totalSize = 0;
                             pim->read = 0;
@@ -104,7 +107,7 @@ Endpoint::run()
                         auto nextMsgSize = *reinterpret_cast<uint32_t*>(remainderPtr);
                         if (remainderSize >= nextMsgSize)
                         {
-                            onMessage({reinterpret_cast<uint8_t*>(remainderPtr), nextMsgSize});
+                            onTcpMessage({reinterpret_cast<uint8_t*>(remainderPtr), nextMsgSize});
                             remainderPtr += nextMsgSize;
                             remainderSize -= nextMsgSize;
                         }
@@ -120,6 +123,33 @@ Endpoint::run()
                 }
             });
         });
+    serverUdpSocket = ns3::Socket::CreateSocket(thisNode, ns3::UdpSocketFactory::GetTypeId());
+    if (serverUdpSocket->Bind(ns3::InetSocketAddress(ns3::Ipv4Address::GetAny(), 1235)) == -1)
+    {
+        NS_FATAL_ERROR("Failed to bind socket");
+    }
+    serverUdpSocket->SetRecvCallback(
+        [this, weakPointer = std::weak_ptr<int>(lifetimePointer)](ns3::Ptr<ns3::Socket> s) {
+            auto p = weakPointer.lock();
+            if (p == nullptr)
+            {
+                return;
+            }
+            while (auto packet = s->Recv())
+            {
+                size_t pktSize = packet->GetSize();
+                recvStatistics += pktSize;
+                recvMsgSize = pktSize;
+                auto pktData = std::make_unique<uint8_t[]>(pktSize);
+                packet->CopyData(pktData.get(), pktSize);
+                auto* size = reinterpret_cast<uint32_t*>(pktData.get());
+                if (*size != pktSize)
+                {
+                    return;
+                }
+                onUdpMessage({pktData.get(), pktSize});
+            }
+        });
     onListeningStart();
 }
 
@@ -130,6 +160,7 @@ Endpoint::~Endpoint()
     {
         item->Close();
     }
-    serverSocket->Close();
+    serverTcpSocket->Close();
+    serverUdpSocket->Close();
 }
 } // namespace zyza

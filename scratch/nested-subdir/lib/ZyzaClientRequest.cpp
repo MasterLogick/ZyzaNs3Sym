@@ -74,7 +74,7 @@ ZyzaClientRequest::sendRequestToNode(uint16_t i)
     auto request = requestBuilder->initRoot<proto::Request>();
     request.setId(reqId);
     request.setRespAddr(host);
-    request.setRespPort(1234);
+    request.setRespPort(1235);
     request.setImpl({req.data(), req.size()});
     uint8_t dropHash[32];
     SHA256(dropSecret, 32, dropHash);
@@ -85,7 +85,13 @@ ZyzaClientRequest::sendRequestToNode(uint16_t i)
 }
 
 void
-ZyzaClientRequest::onMessage(std::span<const uint8_t> message)
+ZyzaClientRequest::onTcpMessage(std::span<const uint8_t> message)
+{
+    // client is not expected to receive tcp messages
+}
+
+void
+ZyzaClientRequest::onUdpMessage(std::span<const uint8_t> message)
 {
     auto* header = reinterpret_cast<const MessageHeader*>(message.data());
     std::clog << ns3::Simulator::Now().As() << ": " << clientId << ": client got message: "
@@ -127,35 +133,19 @@ ZyzaClientRequest::sendToNode(int node,
     uint64_t msgId = 0;
     auto rc = getrandom(&msgId, sizeof(msgId), 0);
     assert(rc == sizeof(msgId));
+    uint32_t size = capnp::computeSerializedSizeInWords(*message) * 8 + sizeof(MessageHeader);
+    auto data = std::make_unique<uint8_t[]>(size);
+    new (data.get()) MessageHeader(size,
+                                   static_cast<uint16_t>(0xffff),
+                                   static_cast<uint16_t>(messageType),
+                                   msgId);
+    kj::ArrayOutputStream aos({data.get() + sizeof(MessageHeader), size - sizeof(MessageHeader)});
+    capnp::writeMessage(aos, *message);
+    ns3::Address address(ns3::InetSocketAddress(p2psh.GetSpokeIpv4Address(node), 1235));
     std::clog << ns3::Simulator::Now().As() << ": " << clientId << ": sending "
               << messageTypeToString(static_cast<MessageType>(messageType)) << " to " << node
               << ": " << std::hex << msgId << std::dec << std::endl;
-    auto con = ns3::Socket::CreateSocket(p2psh.GetSpokeNode(nodesCount + clientId),
-                                         ns3::TcpSocketFactory::GetTypeId());
-    con->Bind();
-    con->SetConnectCallback(
-        [messageType, message, msgId](ns3::Ptr<ns3::Socket> h) {
-            uint32_t size =
-                capnp::computeSerializedSizeInWords(*message) * 8 + sizeof(MessageHeader);
-            auto data = std::make_unique<char[]>(size);
-
-            new (data.get()) MessageHeader(size,
-                                           static_cast<uint16_t>(0xffff),
-                                           static_cast<uint16_t>(messageType),
-                                           msgId);
-            kj::ArrayOutputStream aos(
-                {reinterpret_cast<uint8_t*>(data.get() + sizeof(MessageHeader)),
-                 size - sizeof(MessageHeader)});
-            capnp::writeMessage(aos, *message);
-            h->SetSendCallback([](ns3::Ptr<ns3::Socket> s, auto d) { s->Close(); });
-            h->SetSendCallback([](ns3::Ptr<ns3::Socket> s, auto) { s->Close(); });
-            h->SetCloseCallbacks([](ns3::Ptr<ns3::Socket> s) { s->Close(); },
-                                 [](ns3::Ptr<ns3::Socket> s) { s->Close(); });
-            h->Send(reinterpret_cast<const uint8_t*>(data.get()), size, 0);
-        },
-        [](auto) -> void {});
-    ns3::Address address(ns3::InetSocketAddress(p2psh.GetSpokeIpv4Address(node), 1234));
-    con->Connect(address);
+    serverUdpSocket->SendTo(data.get(), size, 0, address);
 }
 
 void
