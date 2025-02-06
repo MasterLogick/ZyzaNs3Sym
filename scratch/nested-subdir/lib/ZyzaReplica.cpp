@@ -25,22 +25,17 @@ ZyzaReplica::ZyzaReplica(int nodesCount,
     : Endpoint(p2psh.GetSpokeNode(idx)),
       ZyzaCommon(nodesCount, serializedPublicKeys),
       idx(idx),
-      fallbackTimeout(fallbackTimeout),
+      alertTimeout(fallbackTimeout),
       currentFastPathLeader(0),
       currentBackupPathLeader(0),
       initPassed(false),
-      isInFallbackState(false),
-      sentDropRequests(false),
-      sentNetworkStatusRequest(false),
-      sentResendChainRequest(false),
-      fallbackTimerEvent(),
+      alertTimerEvent(),
       proposalOrd(0),
       p2psh(p2psh)
 {
     assert(privateKey.size() == 32);
     memcpy(seckey, privateKey.data(), 32);
     assert(secp256k1_ec_seckey_verify(secpCtx, seckey));
-    memset(proposalHash, 0, sizeof(proposalHash));
     activeNodeConnections.resize(nodesCount);
     sendNetworkStatusRequest();
 }
@@ -49,17 +44,17 @@ void
 ZyzaReplica::sendToClient(const std::string& dstIp,
                           uint16_t dstPort,
                           MessageType messageType,
-                          std::shared_ptr<capnp::MessageBuilder> message)
+                          capnp::MessageBuilder& message)
 {
     uint64_t msgId = 0;
     auto rc = getrandom(&msgId, sizeof(msgId), 0);
     assert(rc == sizeof(msgId));
-    uint32_t size = capnp::computeSerializedSizeInWords(*message) * 8 + sizeof(MessageHeader);
+    uint32_t size = capnp::computeSerializedSizeInWords(message) * 8 + sizeof(MessageHeader);
     auto data = std::make_unique<uint8_t[]>(size);
     new (data.get())
         MessageHeader(size, static_cast<uint16_t>(idx), static_cast<uint16_t>(messageType), msgId);
     kj::ArrayOutputStream aos({data.get() + sizeof(MessageHeader), size - sizeof(MessageHeader)});
-    capnp::writeMessage(aos, *message);
+    capnp::writeMessage(aos, message);
     ns3::Address sinkAddress(ns3::InetSocketAddress(dstIp.c_str(), dstPort));
     std::clog << ns3::Simulator::Now().As() << ": " << idx << ": sending message "
               << messageTypeToString(messageType) << " to client" << std::endl;
@@ -135,21 +130,6 @@ ZyzaReplica::StartApplication()
 }
 
 void
-ZyzaReplica::sendNetworkStatusRequest()
-{
-    int randomNode = 0;
-    do
-    {
-        assert(getrandom(&randomNode, sizeof(randomNode), 0) == sizeof(randomNode));
-        randomNode %= nodesCount;
-    } while (randomNode < 0 || randomNode == idx);
-    capnp::MallocMessageBuilder networkStatusRequestBuilder;
-    networkStatusRequestBuilder.initRoot<proto::NetworkStatusRequest>().setIdx(idx);
-    sendToNode(randomNode, MessageType::NETWORK_STATUS_REQUEST, networkStatusRequestBuilder);
-    sentNetworkStatusRequest = true;
-}
-
-void
 ZyzaReplica::onTcpMessage(std::span<const uint8_t> message)
 {
     auto* header = reinterpret_cast<const MessageHeader*>(message.data());
@@ -164,34 +144,35 @@ ZyzaReplica::onTcpMessage(std::span<const uint8_t> message)
               << ": got message: " << messageTypeToString(messageType) << " from "
               << header->senderIdx << " msgId: " << std::hex << header->msgId << std::dec
               << std::endl;
-    //    hexdump(message.data(), message.size());
     capnp::FlatArrayMessageReader reader(
         {reinterpret_cast<const capnp::word*>(content.data()), content.size() / 8});
-    if (messageType == MessageType::NEXT_ROUND_PROPOSAL && !isLeader() &&
-        header->senderIdx == currentFastPathLeader)
+    if (messageType == MessageType::NEW_PROPOSAL)
     {
         processProposal(reader.getRoot<proto::Proposal>());
     }
-    else if (messageType == MessageType::ROUND_ACK && isLeader())
+    else if (messageType == MessageType::PROPOSAL_ACK)
     {
         processAcknowledgement(reader.getRoot<proto::Acknowledgement>());
     }
-
-    else if (messageType == MessageType::FALLBACK_ALERT && !sentDropRequests)
+    else if (messageType == MessageType::PROPOSAL_KEEP_REQUEST)
+    {
+        processProposalKeepRequest(reader.getRoot<proto::ProposalKeepRequest>());
+    }
+    else if (messageType == MessageType::FALLBACK_ALERT)
     {
         processFallbackAlert(reader.getRoot<proto::FallbackAlert>());
     }
-    else if (messageType == MessageType::RECOVERY && initPassed)
+    else if (messageType == MessageType::PROPOSAL_STATUS_REQUEST)
+    {
+        processProposalStatusRequest(reader.getRoot<proto::ProposalStatusRequest>());
+    }
+    else if (messageType == MessageType::PROPOSAL_STATUS_RESPONSE)
+    {
+        processProposalStatusResponse(reader.getRoot<proto::ProposalStatusResponse>());
+    }
+    else if (messageType == MessageType::RECOVERY)
     {
         processRecovery(reader.getRoot<proto::Recovery>());
-    }
-    else if (messageType == MessageType::NETWORK_STATUS_REQUEST)
-    {
-        processNetworkStatusRequest(reader.getRoot<proto::NetworkStatusRequest>());
-    }
-    else if (messageType == MessageType::NETWORK_STATUS_RESPONSE)
-    {
-        processNetworkStatusResponse(reader.getRoot<proto::NetworkStatusResponse>());
     }
     else if (messageType == MessageType::RESEND_CHAIN_REQUEST)
     {
@@ -218,108 +199,107 @@ ZyzaReplica::onUdpMessage(std::span<const uint8_t> message)
               << ": got message: " << messageTypeToString(messageType) << " from "
               << header->senderIdx << " msgId: " << std::hex << header->msgId << std::dec
               << std::endl;
-    //    hexdump(message.data(), message.size());
     capnp::FlatArrayMessageReader reader(
         {reinterpret_cast<const capnp::word*>(content.data()), content.size() / 8});
     if (messageType == MessageType::REQUEST)
     {
         processRequest(reader.getRoot<proto::Request>());
     }
-    else if (messageType == MessageType::ACCEPT_QUORUM_CERTIFICATE)
-    {
-        processQuorumCertificate(reader.getRoot<proto::QuorumCertificate>());
-    }
-    else if (messageType == MessageType::QUORUM_DROP_RESPONSE && sentDropRequests)
-    {
-        processQuorumDropResponse(reader.getRoot<proto::QuorumDropResponse>());
-    }
 }
 
 void
 ZyzaReplica::processRequest(const proto::Request::Reader& request)
 {
-    if (isLeader())
+    if (currentState == ReplicaState::LEADER_FAST)
     {
-        if (request.getDropHash().size() != 32)
-        {
-            std::clog << "wrong request's drop hash size" << std::endl;
-            return;
-        }
         pendingRequests.emplace_back(new capnp::MallocMessageBuilder())->setRoot(request);
     }
     else
     {
-        auto redirectBuilder = std::make_shared<capnp::MallocMessageBuilder>();
-        auto redirect = redirectBuilder->initRoot<proto::Redirect>();
+        capnp::MallocMessageBuilder redirectBuilder;
+        auto redirect = redirectBuilder.initRoot<proto::Redirect>();
         redirect.setRedirect(currentFastPathLeader);
         sendToClient(request.getRespAddr(),
                      request.getRespPort(),
                      MessageType::REDIRECT_REQUEST,
-                     std::move(redirectBuilder));
+                     redirectBuilder);
     }
 }
 
 void
 ZyzaReplica::processProposal(const proto::Proposal::Reader& proposal)
 {
-    assert(!isLeader());
-    if (!validateProposal(proposal,
-                          proposalHash,
-                          initPassed ? currentFastPathLeader : -1,
-                          initPassed,
-                          proposalOrd))
+    if (currentState != ReplicaState::BACKUP_FAST)
     {
         return;
     }
-    if (initPassed)
+    if (!validateProposal(proposal,
+                          pendingChain.back().first,
+                          initPassed ? currentFastPathLeader : 0,
+                          initPassed,
+                          proposalOrd,
+                          maxPendingChainLength == pendingChain.size(),
+                          pendingChain))
     {
-        auto& newBlock = chain.emplace_back();
-        memcpy(newBlock.first, proposalHash, 32);
-        newBlock.second.setRoot(pendingProposal->getRoot<proto::Proposal>().asReader());
+        return;
     }
     capnp::FlatArrayMessageReader bodyMessage(
         {reinterpret_cast<const capnp::word*>(proposal.getBody().begin()),
          proposal.getBody().size() / 8});
     auto body = bodyMessage.getRoot<proto::ProposalBody>();
     std::clog << idx << ": got valid proposal with ord " << body.getOrd() << std::endl;
-    SHA256(proposal.getBody().asBytes().begin(), proposal.getBody().asBytes().size(), proposalHash);
+    if (initPassed)
+    {
+        for (const auto& item : body.getAcknowledgements())
+        {
+            auto& d = acceptedChain.emplace_back();
+            auto& s = pendingChain.front();
+            memcpy(d.first, s.first, 32);
+            d.second.setRoot(s.second.getRoot<proto::Proposal>().asReader());
+            pendingChain.pop_front();
+        }
+    }
+    uint8_t newProposalHash[32];
+    SHA256(proposal.getBody().asBytes().begin(),
+           proposal.getBody().asBytes().size(),
+           newProposalHash);
     //  hexdump(proposalHash, "received proposal body hash");
+    {
+        auto& pendingBlock = pendingChain.emplace_back();
+        memcpy(pendingBlock.first, newProposalHash, 32);
+        pendingBlock.second.setRoot(proposal);
+    }
     for (const auto& item : body.getRequests())
     {
-        responseToClient(item);
+        responseToClient(item, newProposalHash);
     }
     secp256k1_ecdsa_signature groupSig;
-    int rc = secp256k1_ecdsa_sign(secpCtx, &groupSig, proposalHash, seckey, nullptr, nullptr);
+    int rc = secp256k1_ecdsa_sign(secpCtx, &groupSig, newProposalHash, seckey, nullptr, nullptr);
     assert(rc == 1);
     uint8_t compressedSig[64];
     rc = secp256k1_ecdsa_signature_serialize_compact(secpCtx, compressedSig, &groupSig);
     assert(rc == 1);
     capnp::MallocMessageBuilder ackBuilder;
     auto ack = ackBuilder.initRoot<proto::Acknowledgement>();
-    ack.setProposalHash({proposalHash, 32});
+    ack.setProposalHash({newProposalHash, 32});
     ack.getSign().setSign({compressedSig, 64});
     ack.getSign().setIdx(idx);
-    sendToNode(currentFastPathLeader, MessageType::ROUND_ACK, ackBuilder);
-    collectedQuorumCertificates.clear();
-    pendingProposal = std::make_unique<capnp::MallocMessageBuilder>();
-    pendingProposal->setRoot(proposal);
-    fallbackTimerEvent.Cancel();
-    fallbackTimerEvent =
-        ns3::Simulator::Schedule(ns3::Time::From(fallbackTimeout.count(), ns3::Time::MS),
-                                 [this] { switchToFallback(); });
-    lastUnackedProposal.setRoot(proposal);
+    sendToNode(currentFastPathLeader, MessageType::PROPOSAL_ACK, ackBuilder);
+    alertTimerEvent.Cancel();
+    alertTimerEvent = ns3::Simulator::Schedule(ns3::Time::From(alertTimeout.count(), ns3::Time::MS),
+                                               [this] { switchToFallback(); });
     initPassed = true;
     proposalOrd++;
-    acceptedFallbackAlerts.clear();
-    isInFallbackState = false;
-    sentDropRequests = false;
     std::clog << "processed proposal" << std::endl;
 }
 
 void
 ZyzaReplica::processAcknowledgement(const proto::Acknowledgement::Reader& reader)
 {
-    assert(isLeader());
+    if (currentState != ReplicaState::LEADER_FAST)
+    {
+        return;
+    }
     if (reader.getProposalHash().size() != 32)
     {
         std::clog << "wrong ack proposal hash size" << std::endl;
@@ -330,18 +310,17 @@ ZyzaReplica::processAcknowledgement(const proto::Acknowledgement::Reader& reader
         std::clog << "wrong ack proposal sign size" << std::endl;
         return;
     }
-    if (pendingProposalAcks.contains(reader.getSign().getIdx()))
+    for (auto& item : pendingProposalAcks)
     {
-        std::clog << "ack resend" << std::endl;
-        return;
-    }
-    if (memcmp(proposalHash, reader.getProposalHash().begin(), 32) != 0 && initPassed)
-    {
-        hexdump(reader.getProposalHash().begin(), "wrong ack proposal hash");
-        hexdump(proposalHash, "expected hash");
-        return;
-    }
-    {
+        if (memcmp(item.first, reader.getProposalHash().begin(), 32) != 0)
+        {
+            continue;
+        }
+        if (item.second.contains(reader.getSign().getIdx()))
+        {
+            std::clog << "ack resend" << std::endl;
+            return;
+        }
         secp256k1_ecdsa_signature sig;
         int rc = secp256k1_ecdsa_signature_parse_compact(secpCtx,
                                                          &sig,
@@ -353,32 +332,23 @@ ZyzaReplica::processAcknowledgement(const proto::Acknowledgement::Reader& reader
         }
         rc = secp256k1_ecdsa_verify(secpCtx,
                                     &sig,
-                                    proposalHash,
+                                    item.first,
                                     &publicKeys[reader.getSign().getIdx()]);
         if (!rc)
         {
             std::clog << "wrong ack proposal sign" << std::endl;
             return;
         }
-    }
-    auto* d = pendingProposalAcks[reader.getSign().getIdx()];
-    memcpy(d, reader.getSign().getSign().begin(), 64);
-    if (pendingProposalAcks.size() == quorumSize)
-    {
-        startNewRound();
-    }
-    std::clog << "processed ack" << std::endl;
-}
-
-void
-ZyzaReplica::processQuorumCertificate(const proto::QuorumCertificate::Reader& qc)
-{
-    if (!validateQuorumCertificate(qc, proposalHash))
-    {
-        std::clog << "wrong quorum certificate" << std::endl;
+        auto* d = item.second[reader.getSign().getIdx()];
+        memcpy(d, reader.getSign().getSign().begin(), 64);
+        if (pendingProposalAcks.size() == quorumSize)
+        {
+            startNewRound();
+        }
+        std::clog << "processed ack" << std::endl;
         return;
     }
-    collectedQuorumCertificates[qc.getResponse().getId()].setRoot(qc);
+    hexdump(reader.getProposalHash().begin(), "unknown ack proposal hash");
 }
 
 void
@@ -522,7 +492,7 @@ ZyzaReplica::startNewRound()
     sentStatistics = 0;
     recvStatistics = 0;
     last = t;
-    auto& newBlock = chain.emplace_back();
+    auto& newBlock = acceptedChain.emplace_back();
     memcpy(newBlock.first, proposalHash, 32);
     newBlock.second.setRoot(pendingProposal->getRoot<proto::Proposal>().asReader());
     initPassed = true;
@@ -576,7 +546,7 @@ ZyzaReplica::startNewRound()
         {
             continue;
         }
-        sendToNode(i, MessageType::NEXT_ROUND_PROPOSAL, *pendingProposal);
+        sendToNode(i, MessageType::NEW_PROPOSAL, *pendingProposal);
     }
 
     pendingProposalAcks.clear();
@@ -587,12 +557,6 @@ ZyzaReplica::startNewRound()
     memcpy(pendingProposalAcks[idx], compSig, 64);
     collectedQuorumCertificates.clear();
     std::clog << "started a new round" << std::endl;
-}
-
-bool
-ZyzaReplica::isLeader() const
-{
-    return currentFastPathLeader == idx;
 }
 
 std::vector<uint8_t>
@@ -633,7 +597,7 @@ ZyzaReplica::sendPendingNodeMessages(int i)
 }
 
 void
-ZyzaReplica::responseToClient(const proto::Request::Reader& request)
+ZyzaReplica::responseToClient(const proto::Request::Reader& request, uint8_t* proposalHash)
 {
     capnp::MallocMessageBuilder respBodyBuilder;
     auto respBody = respBodyBuilder.initRoot<proto::ResponseBody>();
@@ -666,7 +630,7 @@ void
 ZyzaReplica::switchToFallback()
 {
     std::clog << idx << ": switching to fallback" << std::endl;
-    fallbackTimerEvent.Cancel();
+    alertTimerEvent.Cancel();
     isInFallbackState = true;
     sentDropRequests = false;
     currentBackupPathLeader = (currentFastPathLeader + 1) % nodesCount;
@@ -1029,10 +993,10 @@ ZyzaReplica::recoverWithProposal(const proto::Proposal::Reader& proposal)
         ack.setProposalHash({proposalHash, 32});
         ack.getSign().setSign({sign, 64});
         ack.getSign().setIdx(idx);
-        sendToNode(currentBackupPathLeader, MessageType::ROUND_ACK, ackBuilder);
-        fallbackTimerEvent.Cancel();
-        fallbackTimerEvent =
-            ns3::Simulator::Schedule(ns3::Time::From(fallbackTimeout.count(), ns3::Time::MS),
+        sendToNode(currentBackupPathLeader, MessageType::PROPOSAL_ACK, ackBuilder);
+        alertTimerEvent.Cancel();
+        alertTimerEvent =
+            ns3::Simulator::Schedule(ns3::Time::From(alertTimeout.count(), ns3::Time::MS),
                                      [this] { switchToFallback(); });
     }
     else
@@ -1080,7 +1044,7 @@ ZyzaReplica::processNetworkStatusResponse(const proto::NetworkStatusResponse::Re
         sentNetworkStatusRequest = false;
         capnp::MallocMessageBuilder resendChainBuilder;
         auto resendChain = resendChainBuilder.initRoot<proto::ResendChainRequest>();
-        if (chain.empty())
+        if (acceptedChain.empty())
         {
             uint8_t zeroHash[32];
             memset(zeroHash, 0, 32);
@@ -1088,7 +1052,7 @@ ZyzaReplica::processNetworkStatusResponse(const proto::NetworkStatusResponse::Re
         }
         else
         {
-            auto& hash = chain.back().first;
+            auto& hash = acceptedChain.back().first;
             resendChain.setLastAckedProposal({hash, 32});
         }
         resendChain.setIdx(idx);
@@ -1130,7 +1094,7 @@ ZyzaReplica::startLeaderZeroNode()
     {
         if (i == idx)
             continue;
-        sendToNode(i, MessageType::NEXT_ROUND_PROPOSAL, *pendingProposal);
+        sendToNode(i, MessageType::NEW_PROPOSAL, *pendingProposal);
     }
 }
 
@@ -1151,7 +1115,7 @@ ZyzaReplica::processResendChainRequest(const proto::ResendChainRequest::Reader& 
         std::clog << "wrong resend chain node idx" << std::endl;
         return;
     }
-    if (chain.empty())
+    if (acceptedChain.empty())
     {
         return;
     }
@@ -1159,13 +1123,13 @@ ZyzaReplica::processResendChainRequest(const proto::ResendChainRequest::Reader& 
     memset(zeroHash, 0, 32);
     if (memcmp(zeroHash, nsr.getLastAckedProposal().begin(), 32) == 0)
     {
-        resendChainPart(chain.begin(), nsr.getIdx(), chain.size());
+        resendChainPart(acceptedChain.begin(), nsr.getIdx(), acceptedChain.size());
     }
     else
     {
-        auto iter = chain.end();
+        auto iter = acceptedChain.end();
         int count = 0;
-        while (iter != chain.begin())
+        while (iter != acceptedChain.begin())
         {
             iter--;
             count++;
@@ -1189,7 +1153,7 @@ ZyzaReplica::resendChainPart(
     auto resendChainResponse = resendChainResponseBuilder.initRoot<proto::ResendChainResponse>();
     auto chainPart = resendChainResponse.initChainPart(partSize + 1);
     int i = 0;
-    while (it != chain.end())
+    while (it != acceptedChain.end())
     {
         if (i == partSize)
         {
@@ -1224,7 +1188,7 @@ ZyzaReplica::processResendChainResponse(const proto::ResendChainResponse::Reader
     {
         return;
     }
-    if (chain.empty() && chainPart.size() == 1)
+    if (acceptedChain.empty() && chainPart.size() == 1)
     {
         return;
     }
@@ -1234,12 +1198,12 @@ ZyzaReplica::processResendChainResponse(const proto::ResendChainResponse::Reader
     bool oldInitPassed = initPassed;
     while (it != chainPart.end())
     {
-        const uint8_t* expectedPrevHash = initPassed ? chain.back().first : zeroHash;
+        const uint8_t* expectedPrevHash = initPassed ? acceptedChain.back().first : zeroHash;
         if (!validateProposal(*it, expectedPrevHash, -1, initPassed, -1))
         {
             break;
         }
-        auto& newBlock = chain.emplace_back();
+        auto& newBlock = acceptedChain.emplace_back();
         SHA256(it->getBody().begin(), it->getBody().size(), newBlock.first);
         newBlock.second.setRoot(*it);
         initPassed = true;
@@ -1250,15 +1214,15 @@ ZyzaReplica::processResendChainResponse(const proto::ResendChainResponse::Reader
     {
         return;
     }
-    auto& lastBlock = chain.back();
+    auto& lastBlock = acceptedChain.back();
     pendingProposal->setRoot(lastBlock.second.getRoot<proto::Proposal>().asReader());
     memcpy(proposalHash, lastBlock.first, 32);
-    chain.pop_back();
+    acceptedChain.pop_back();
     if (initPassed)
     {
-        fallbackTimerEvent.Cancel();
-        fallbackTimerEvent =
-            ns3::Simulator::Schedule(ns3::Time::From(fallbackTimeout.count(), ns3::Time::MS),
+        alertTimerEvent.Cancel();
+        alertTimerEvent =
+            ns3::Simulator::Schedule(ns3::Time::From(alertTimeout.count(), ns3::Time::MS),
                                      [this] { switchToFallback(); });
     }
 }

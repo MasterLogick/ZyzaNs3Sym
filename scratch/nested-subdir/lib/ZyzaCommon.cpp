@@ -3,6 +3,7 @@
 #include <capnp/serialize.h>
 #include <cassert>
 #include <iostream>
+#include <list>
 #include <openssl/sha.h>
 #include <sstream>
 #include <sys/random.h>
@@ -31,11 +32,16 @@ ZyzaCommon::ZyzaCommon(int nodesCount, std::vector<std::vector<uint8_t>>& serial
 }
 
 bool
-ZyzaCommon::validateProposal(const proto::Proposal::Reader& proposal,
-                             const uint8_t* expectedPrevProposalHash,
-                             int expectedProposalSigner,
-                             bool checkQuorumSize,
-                             int proposalIndex)
+ZyzaCommon::validateProposal(
+    const proto::Proposal::Reader& proposal,
+    const uint8_t* expectedPrevProposalHash,
+    int expectedProposalSigner,
+    bool checkQuorumSize,
+    int proposalIndex,
+    bool mustContainAcks,
+    std::optional<
+        std::reference_wrapper<std::list<std::pair<uint8_t[32], capnp::MallocMessageBuilder>>>>
+        pendingChain)
 {
     capnp::FlatArrayMessageReader bodyMessage(
         {reinterpret_cast<const capnp::word*>(proposal.getBody().begin()),
@@ -45,6 +51,11 @@ ZyzaCommon::validateProposal(const proto::Proposal::Reader& proposal,
     {
         std::clog << "wrong proposal index " << body.getOrd() << ", expected " << proposalIndex
                   << std::endl;
+        return false;
+    }
+    if (mustContainAcks && body.getAcknowledgements().size() == 0)
+    {
+        std::clog << "provided proposal must contain acknowledgements" << std::endl;
         return false;
     }
     if (body.getAcknowledgements().size() != quorumSize && checkQuorumSize)
@@ -80,41 +91,48 @@ ZyzaCommon::validateProposal(const proto::Proposal::Reader& proposal,
         }
     }
     int rc = 0;
-    for (const auto& item : body.getAcknowledgements())
+    if (pendingChain.has_value())
     {
-        if (item.getSign().size() != 64)
+        if (pendingChain->get().size() > body.getAcknowledgements().size())
         {
-            std::clog << "wrong proposal ack sign size" << std::endl;
+            std::clog << "got acknowledgements for unknown blocks" << std::endl;
             return false;
         }
-        if (item.getIdx() >= nodesCount)
+        auto b = pendingChain->get().begin();
+        for (const auto& ack : body.getAcknowledgements())
         {
-            std::clog << "wrong proposal ack node id" << std::endl;
-            return false;
-        }
-        secp256k1_ecdsa_signature sig;
-        rc = secp256k1_ecdsa_signature_parse_compact(secpCtx, &sig, item.getSign().begin());
-        if (!rc)
-        {
-            std::clog << "wrong proposal ack packed sign" << std::endl;
-            return false;
-        }
-        rc = secp256k1_ecdsa_verify(secpCtx,
-                                    &sig,
-                                    body.getPrevProposalHash().begin(),
-                                    &publicKeys[item.getIdx()]);
-        if (!rc)
-        {
-            std::clog << "wrong proposal ack sign" << std::endl;
-            return false;
-        }
-    }
-    for (const auto& item : body.getRequests())
-    {
-        if (item.getDropHash().size() != 32)
-        {
-            std::clog << "wrong request's drop hash" << std::endl;
-            return false;
+            if (ack.size() != quorumSize)
+            {
+                std::clog << "wrong acknowledgement size" << std::endl;
+                return false;
+            }
+            for (const auto& item : ack)
+            {
+                if (item.getSign().size() != 64)
+                {
+                    std::clog << "wrong proposal ack sign size" << std::endl;
+                    return false;
+                }
+                if (item.getIdx() >= nodesCount)
+                {
+                    std::clog << "wrong proposal ack node id" << std::endl;
+                    return false;
+                }
+                secp256k1_ecdsa_signature sig;
+                rc = secp256k1_ecdsa_signature_parse_compact(secpCtx, &sig, item.getSign().begin());
+                if (!rc)
+                {
+                    std::clog << "wrong proposal ack packed sign" << std::endl;
+                    return false;
+                }
+                rc = secp256k1_ecdsa_verify(secpCtx, &sig, b->first, &publicKeys[item.getIdx()]);
+                if (!rc)
+                {
+                    std::clog << "wrong proposal ack sign" << std::endl;
+                    return false;
+                }
+            }
+            b++;
         }
     }
     uint8_t receivedProposalHash[32];

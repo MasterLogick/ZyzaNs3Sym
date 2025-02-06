@@ -43,6 +43,7 @@ class ZyzaReplica : public Endpoint, public ZyzaCommon, public ns3::Application
     void onListeningStart() override;
 
     void onTcpMessage(std::span<const uint8_t> message) override;
+
     void onUdpMessage(std::span<const uint8_t> message) override;
 
   private:
@@ -52,19 +53,13 @@ class ZyzaReplica : public Endpoint, public ZyzaCommon, public ns3::Application
 
     void processProposal(const proto::Proposal::Reader& proposal);
 
-    void processAcknowledgement(const proto::Acknowledgement::Reader& ack);
+    void processProposalKeepRequest(const proto::ProposalKeepRequest::Reader& proposalKeepRequest);
 
-    void processQuorumCertificate(const proto::QuorumCertificate::Reader& qc);
+    void processAcknowledgement(const proto::Acknowledgement::Reader& ack);
 
     void processFallbackAlert(const proto::FallbackAlert::Reader& fallbackAlert);
 
-    void processQuorumDropResponse(const proto::QuorumDropResponse::Reader& quorumDropResponse);
-
     void processRecovery(const proto::Recovery::Reader& recovery);
-
-    void processNetworkStatusRequest(const proto::NetworkStatusRequest::Reader& nsr);
-
-    void processNetworkStatusResponse(const proto::NetworkStatusResponse::Reader& nsr);
 
     void processResendChainRequest(const proto::ResendChainRequest::Reader& nsr);
 
@@ -75,13 +70,13 @@ class ZyzaReplica : public Endpoint, public ZyzaCommon, public ns3::Application
     void sendToClient(const std::string& dstIp,
                       uint16_t dstPort,
                       MessageType messageType,
-                      std::shared_ptr<capnp::MessageBuilder> message);
+                      capnp::MessageBuilder& message);
 
     void sendToNode(int node, MessageType messageType, capnp::MessageBuilder& message);
 
     void restartConnectionToNode(int i);
 
-    void responseToClient(const proto::Request::Reader& request);
+    void responseToClient(const proto::Request::Reader& request, uint8_t* proposalHash);
 
     void sendPendingNodeMessages(int i);
 
@@ -96,8 +91,6 @@ class ZyzaReplica : public Endpoint, public ZyzaCommon, public ns3::Application
 
     void switchToFallback();
 
-    void sendNetworkStatusRequest();
-
     void startLeaderZeroNode();
 
     bool signData(const uint8_t* data, size_t size, uint8_t* result);
@@ -110,38 +103,45 @@ class ZyzaReplica : public Endpoint, public ZyzaCommon, public ns3::Application
 
     bool validateQuorumCertificate(const proto::QuorumCertificate::Reader& reader,
                                    uint8_t* expectedResponseProposalHash);
-
-    bool isLeader() const;
-
+    // parameters
     int idx;
     uint8_t seckey[32];
-    std::chrono::milliseconds fallbackTimeout;
+    std::chrono::milliseconds alertTimeout;
+    int maxPendingChainLength;
 
-    std::vector<ns3::Ptr<ns3::Socket>> activeNodeConnections;
-
+    // backup node fast path variables
     int currentFastPathLeader;
+    std::list<std::pair<uint8_t[32], capnp::MallocMessageBuilder>> acceptedChain;
+    std::list<std::pair<uint8_t[32], capnp::MallocMessageBuilder>> pendingChain;
+    //    std::shared_ptr<uvw::timer_handle> fallbackTimer;
+    ns3::EventId alertTimerEvent;
+
+    // backup node fallback path variables
     int currentBackupPathLeader;
-    std::list<std::pair<uint8_t[32], capnp::MallocMessageBuilder>> chain;
-    uint8_t proposalHash[32];
-    std::unique_ptr<capnp::MallocMessageBuilder> pendingProposal;
+    std::unique_ptr<capnp::MallocMessageBuilder> recoveryMessageBuilder;
+    uint8_t recoveryMessageHash[32];
+    std::set<uint16_t> recoveryAcks;
+
+    // leader node fallback path variables
+    std::map<uint16_t, capnp::MallocMessageBuilder> acceptedFallbackAlerts;
+    std::map<uint8_t[32], capnp::MallocMessageBuilder> proposalStatuses;
+
+    // leader node fast path variables
+    std::vector<std::unique_ptr<capnp::MallocMessageBuilder>> pendingRequests;
+    std::map<uint8_t[32], std::map<uint16_t, uint8_t[64]>> pendingProposalAcks;
+
+    // common variables
+    enum class ReplicaState
+    {
+        BACKUP_FAST = 1,
+        BACKUP_FALLBACK = 2,
+        LEADER_FAST = 3,
+        LEADER_FALLBACK = 4
+    } currentState;
+    int proposalOrd;
     std::map<uint16_t, std::vector<std::pair<std::unique_ptr<char[]>, uint32_t>>>
         pendingNodeMessages;
-    std::map<int, uint8_t[64]> pendingProposalAcks;
-    std::vector<std::unique_ptr<capnp::MallocMessageBuilder>> pendingRequests;
-    int proposalOrd;
-
-    std::map<uint64_t, capnp::MallocMessageBuilder> collectedQuorumCertificates;
-    capnp::MallocMessageBuilder lastUnackedProposal;
-    //    std::shared_ptr<uvw::timer_handle> fallbackTimer;
-    ns3::EventId fallbackTimerEvent;
-    bool isInFallbackState;
-    bool sentDropRequests;
-    std::map<int, std::unique_ptr<capnp::MallocMessageBuilder>> acceptedFallbackAlerts;
-    std::map<uint64_t, FallbackRequestState> uniqueRequests;
-    int fallbackClientResponsesCollected;
     bool initPassed;
-    bool sentNetworkStatusRequest;
-    bool sentResendChainRequest;
 
     ns3::Time last;
     ns3::Time start;
@@ -150,6 +150,7 @@ class ZyzaReplica : public Endpoint, public ZyzaCommon, public ns3::Application
     uint64_t sentStatistics = 0;
     uint64_t sentMsgSize = 0;
     ns3::PointToPointStarHelper& p2psh;
+    std::vector<ns3::Ptr<ns3::Socket>> activeNodeConnections;
 };
 } // namespace zyza
 

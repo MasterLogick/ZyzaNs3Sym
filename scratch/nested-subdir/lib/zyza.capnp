@@ -11,9 +11,8 @@ struct Signature {
 struct Request {
     impl @0 :Data;
     id @1 :UInt64;
-    dropHash @2 :Data;
-    respAddr @3 :Text;
-    respPort @4 :UInt16;
+    respAddr @2 :Text;
+    respPort @3 :UInt16;
 }
 
 struct ResponseBody {
@@ -29,7 +28,7 @@ struct Response {
 
 struct ProposalBody {
     prevProposalHash @0 :Data;
-    acknowledgements @1 :List(Signature);
+    acknowledgements @1 :List(List(Signature));
     requests @2 :List(Request);
     ord @3 :UInt32;
 }

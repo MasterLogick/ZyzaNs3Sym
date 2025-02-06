@@ -14,20 +14,25 @@ struct MessageHeader
 
 enum class MessageType
 {
+    // client-node communication
     REQUEST = 1,
-    RESPONSE = 2,
-    NEXT_ROUND_PROPOSAL = 3,
-    ROUND_ACK = 4,
-    ACCEPT_QUORUM_CERTIFICATE = 5,
-    REDIRECT_REQUEST = 6,
+    REDIRECT_REQUEST = 2,
+    RESPONSE = 3,
+
+    // node-leader fast path communication
+    NEW_PROPOSAL = 4,
+    PROPOSAL_ACK = 5,
+    PROPOSAL_KEEP_REQUEST = 6,
+
+    // node-node fallback path communication
     FALLBACK_ALERT = 7,
-    QUORUM_DROP_REQUEST = 8,
-    QUORUM_DROP_RESPONSE = 9,
+    PROPOSAL_STATUS_REQUEST = 8,
+    PROPOSAL_STATUS_RESPONSE = 9,
     RECOVERY = 10,
-    NETWORK_STATUS_REQUEST = 11,
-    NETWORK_STATUS_RESPONSE = 12,
-    RESEND_CHAIN_REQUEST = 13,
-    RESEND_CHAIN_RESPONSE = 14,
+
+    // node history recovery
+    RESEND_CHAIN_REQUEST = 11,
+    RESEND_CHAIN_RESPONSE = 12,
 };
 
 constexpr const char*
@@ -37,32 +42,32 @@ messageTypeToString(MessageType type)
     {
     case MessageType::REQUEST:
         return "REQUEST";
-    case MessageType::RESPONSE:
-        return "RESPONSE";
-    case MessageType::NEXT_ROUND_PROPOSAL:
-        return "NEXT_ROUND_PROPOSAL";
-    case MessageType::ROUND_ACK:
-        return "ROUND_ACK";
-    case MessageType::ACCEPT_QUORUM_CERTIFICATE:
-        return "ACCEPT_QUORUM_CERTIFICATE";
     case MessageType::REDIRECT_REQUEST:
         return "REDIRECT_REQUEST";
+    case MessageType::RESPONSE:
+        return "RESPONSE";
+
+    case MessageType::NEW_PROPOSAL:
+        return "NEXT_ROUND_PROPOSAL";
+    case MessageType::PROPOSAL_ACK:
+        return "ROUND_ACK";
+    case MessageType::PROPOSAL_KEEP_REQUEST:
+        return "PROPOSAL_KEEP_REQUEST";
+
     case MessageType::FALLBACK_ALERT:
         return "FALLBACK_ALERT";
-    case MessageType::QUORUM_DROP_REQUEST:
-        return "QUORUM_DROP_REQUEST";
-    case MessageType::QUORUM_DROP_RESPONSE:
-        return "QUORUM_DROP_RESPONSE";
+    case MessageType::PROPOSAL_STATUS_REQUEST:
+        return "PROPOSAL_STATUS_REQUEST";
+    case MessageType::PROPOSAL_STATUS_RESPONSE:
+        return "PROPOSAL_STATUS_RESPONSE";
     case MessageType::RECOVERY:
         return "RECOVERY";
-    case MessageType::NETWORK_STATUS_REQUEST:
-        return "NETWORK_STATUS_REQUEST";
-    case MessageType::NETWORK_STATUS_RESPONSE:
-        return "NETWORK_STATUS_RESPONSE";
+
     case MessageType::RESEND_CHAIN_REQUEST:
         return "RESEND_CHAIN";
     case MessageType::RESEND_CHAIN_RESPONSE:
         return "RESEND_CHAIN_RESPONSE";
+
     default:
         return "UNKNOWN";
     }
