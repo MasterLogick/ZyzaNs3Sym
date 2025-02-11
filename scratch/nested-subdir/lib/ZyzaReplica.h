@@ -20,137 +20,151 @@
 #include <span>
 #include <vector>
 
-namespace zyza
-{
-class ZyzaReplica : public Endpoint, public ZyzaCommon, public ns3::Application
-{
-  public:
-    ZyzaReplica(int nodesCount,
-                int idx,
-                ns3::PointToPointStarHelper& p2psh,
-                std::vector<std::vector<uint8_t>>& serializedPublicKeys,
-                std::span<const uint8_t> privateKey,
-                std::chrono::milliseconds fallbackTimeout);
+namespace zyza {
+class ZyzaReplica : public Endpoint,
+                    public ZyzaCommon,
+                    public ns3::Application {
+public:
+  ZyzaReplica(int nodesCount, int idx, ns3::PointToPointStarHelper &p2psh,
+              std::vector<std::vector<uint8_t>> &serializedPublicKeys,
+              std::span<const uint8_t> privateKey,
+              std::chrono::milliseconds fallbackTimeout);
 
-    ~ZyzaReplica() noexcept override {};
+  ~ZyzaReplica() noexcept override = default;
 
-  private:
-    void StartApplication() override;
+private:
+  void StartApplication() override;
 
-  protected:
-    virtual std::vector<uint8_t> processRequest(std::span<const uint8_t> request);
+protected:
+  virtual std::vector<uint8_t> processRequest(std::span<const uint8_t> request);
 
-    void onListeningStart() override;
+  void onListeningStart() override;
 
-    void onTcpMessage(std::span<const uint8_t> message) override;
+  void onTcpMessage(std::span<const uint8_t> message) override;
 
-    void onUdpMessage(std::span<const uint8_t> message) override;
+  void onUdpMessage(std::span<const uint8_t> message) override;
 
-  private:
-    void startNewRound();
+private:
+  void processRequest(const proto::Request::Reader &reader);
 
-    void processRequest(const proto::Request::Reader& reader);
+  void processProposal(const proto::SignedMessage::Reader &proposal,
+                       bool checkSigner);
 
-    void processProposal(const proto::Proposal::Reader& proposal);
+  void processAcknowledgement(const proto::Acknowledgement::Reader &ack);
 
-    void processProposalKeepRequest(const proto::ProposalKeepRequest::Reader& proposalKeepRequest);
+  void processProposalKeepRequest(
+      const proto::Acknowledgement::Reader &proposalKeepRequest);
 
-    void processAcknowledgement(const proto::Acknowledgement::Reader& ack);
+  void processFallbackAlert(const proto::SignedMessage::Reader &fallbackAlert);
 
-    void processFallbackAlert(const proto::FallbackAlert::Reader& fallbackAlert);
+  void processProposalStatusRequest(
+      const proto::ProposalStatusRequest::Reader &proposalStatusRequest);
 
-    void processRecovery(const proto::Recovery::Reader& recovery);
+  void processProposalStatusResponse(
+      const proto::SignedMessage::Reader &proposalStatusRequest);
 
-    void processResendChainRequest(const proto::ResendChainRequest::Reader& nsr);
+  void processRecovery(const proto::Recovery::Reader &recovery);
 
-    void processResendChainResponse(const proto::ResendChainResponse::Reader& nsr);
+  void processRecoveryAck(const proto::RecoveryAck::Reader &recoveryAck);
 
-    void recoverWithProposal(const proto::Proposal::Reader& proposal);
+  void processResendChainRequest(const proto::ResendChainRequest::Reader &nsr);
 
-    void sendToClient(const std::string& dstIp,
-                      uint16_t dstPort,
-                      MessageType messageType,
-                      capnp::MessageBuilder& message);
+  void
+  processResendChainResponse(const proto::ResendChainResponse::Reader &nsr);
 
-    void sendToNode(int node, MessageType messageType, capnp::MessageBuilder& message);
+  void transitionToNextBackupLeader();
 
-    void restartConnectionToNode(int i);
+  void transitionToLeaderFallback();
 
-    void responseToClient(const proto::Request::Reader& request, uint8_t* proposalHash);
+  void onPendingBlockAcksReady();
 
-    void sendPendingNodeMessages(int i);
+  void onRequestAccepted();
 
-    void resendChainPart(
-        std::list<std::pair<uint8_t[32], capnp::MallocMessageBuilder>>::iterator it,
-        int idx,
-        int partSize);
+  void startNewRound();
 
-    void sendDropRequests();
+  void responseToClient(const proto::Request::Reader &request,
+                        uint8_t *proposalHash);
 
-    void broadcastRecovery();
+  void resendChainPart(
+      std::list<std::pair<uint8_t[32], capnp::MallocMessageBuilder>>::iterator
+          acceptedChainIter,
+      int idx, int acceptedChainPartSize);
 
-    void switchToFallback();
+  void handleBackupFastPathTimeout();
 
-    void startLeaderZeroNode();
+  void sendToClient(const std::string &dstIp, uint16_t dstPort,
+                    MessageType messageType, capnp::MessageBuilder &message);
 
-    bool signData(const uint8_t* data, size_t size, uint8_t* result);
+  void sendToNode(int node, MessageType messageType,
+                  capnp::MessageBuilder &message);
 
-    bool signData(const uint8_t* hash, uint8_t* result);
+  void restartConnectionToNode(int i);
 
-    bool validateData(const capnp::Data::Reader& data, const proto::Signature::Reader& signature);
+  void sendPendingNodeMessages(int i);
 
-    bool validateData(const uint8_t* hash, const uint8_t* sign, int signer);
+  std::vector<uint16_t> getProposalKeepers(std::span<uint8_t, 32> hash);
 
-    bool validateQuorumCertificate(const proto::QuorumCertificate::Reader& reader,
-                                   uint8_t* expectedResponseProposalHash);
-    // parameters
-    int idx;
-    uint8_t seckey[32];
-    std::chrono::milliseconds alertTimeout;
-    int maxPendingChainLength;
+  void createSignedMessage(capnp::MallocMessageBuilder &body,
+                           capnp::MallocMessageBuilder &message);
 
-    // backup node fast path variables
-    int currentFastPathLeader;
-    std::list<std::pair<uint8_t[32], capnp::MallocMessageBuilder>> acceptedChain;
-    std::list<std::pair<uint8_t[32], capnp::MallocMessageBuilder>> pendingChain;
-    //    std::shared_ptr<uvw::timer_handle> fallbackTimer;
-    ns3::EventId alertTimerEvent;
+  void signData(const uint8_t *data, size_t size, uint8_t *result);
 
-    // backup node fallback path variables
-    int currentBackupPathLeader;
-    std::unique_ptr<capnp::MallocMessageBuilder> recoveryMessageBuilder;
-    uint8_t recoveryMessageHash[32];
-    std::set<uint16_t> recoveryAcks;
+  void signData(const uint8_t *hash, uint8_t *result);
 
-    // leader node fallback path variables
-    std::map<uint16_t, capnp::MallocMessageBuilder> acceptedFallbackAlerts;
-    std::map<uint8_t[32], capnp::MallocMessageBuilder> proposalStatuses;
+  // parameters
+  int idx;
+  uint8_t seckey[32];
+  std::chrono::milliseconds alertTimeout;
+  int maxPendingChainLength;
+  int keepersPerProposal;
 
-    // leader node fast path variables
-    std::vector<std::unique_ptr<capnp::MallocMessageBuilder>> pendingRequests;
-    std::map<uint8_t[32], std::map<uint16_t, uint8_t[64]>> pendingProposalAcks;
+  // backup node fast path variables
+  int currentFastPathLeader;
+  std::list<std::pair<uint8_t[32], capnp::MallocMessageBuilder>> pendingChain;
+  ns3::EventId backupFastPathTimeout;
 
-    // common variables
-    enum class ReplicaState
-    {
-        BACKUP_FAST = 1,
-        BACKUP_FALLBACK = 2,
-        LEADER_FAST = 3,
-        LEADER_FALLBACK = 4
-    } currentState;
-    int proposalOrd;
-    std::map<uint16_t, std::vector<std::pair<std::unique_ptr<char[]>, uint32_t>>>
-        pendingNodeMessages;
-    bool initPassed;
+  // backup node fallback path variables
+  int currentBackupPathLeader;
+  std::unique_ptr<capnp::MallocMessageBuilder> recoveryMessageBuilder;
+  uint8_t recoveryMessageHash[32];
+  std::set<uint16_t> recoveryAcks;
+  ns3::EventId nextLeaderAlertTimerEvent;
 
-    ns3::Time last;
-    ns3::Time start;
-    std::chrono::system_clock::duration sum;
-    int sumCount;
-    uint64_t sentStatistics = 0;
-    uint64_t sentMsgSize = 0;
-    ns3::PointToPointStarHelper& p2psh;
-    std::vector<ns3::Ptr<ns3::Socket>> activeNodeConnections;
+  // leader node fallback path variables
+  std::map<uint16_t, capnp::MallocMessageBuilder> acceptedFallbackAlerts;
+  std::map<uint8_t[32], capnp::MallocMessageBuilder> proposalStatuses;
+
+  // leader node fast path variables
+  std::vector<std::unique_ptr<capnp::MallocMessageBuilder>> pendingRequests;
+  struct PendingProposal {
+    uint8_t blockHash[32];
+    std::map<uint16_t, uint8_t[64]> acks;
+    capnp::MallocMessageBuilder proposal;
+  };
+  std::list<PendingProposal> pendingProposals;
+
+  // common variables
+  enum class ReplicaState {
+    BACKUP_FAST = 1,
+    BACKUP_FALLBACK = 2,
+    LEADER_FAST = 3,
+    LEADER_FALLBACK = 4
+  } currentState;
+  std::vector<std::unique_ptr<capnp::MallocMessageBuilder>> keptProposalAcks;
+  int proposalOrd;
+  std::map<uint16_t, std::vector<std::pair<std::unique_ptr<char[]>, uint32_t>>>
+      pendingNodeMessages;
+  bool initPassed;
+  std::list<std::pair<uint8_t[32], capnp::MallocMessageBuilder>> acceptedChain;
+
+  ns3::Time last;
+  ns3::Time start;
+  std::chrono::system_clock::duration sum;
+  int sumCount;
+  uint64_t sentStatistics = 0;
+  uint64_t sentMsgSize = 0;
+  ns3::PointToPointStarHelper &p2psh;
+  std::vector<ns3::Ptr<ns3::Socket>> activeNodeConnections;
 };
 } // namespace zyza
 

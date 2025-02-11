@@ -8,6 +8,11 @@ struct Signature {
     sign @1 :Data;
 }
 
+struct SignedMessage {
+    body @0 :Data;
+    sign @1 :Signature;
+}
+
 struct Request {
     impl @0 :Data;
     id @1 :UInt64;
@@ -15,15 +20,14 @@ struct Request {
     respPort @3 :UInt16;
 }
 
+struct Redirect {
+    redirect @0 :UInt16;
+}
+
 struct ResponseBody {
     impl @0 :Data;
     id @1 :UInt64;
     proposalHash @2 :Data;
-}
-
-struct Response {
-    body @0 :Data;
-    sign @1 :Signature;
 }
 
 struct ProposalBody {
@@ -33,58 +37,46 @@ struct ProposalBody {
     ord @3 :UInt32;
 }
 
-struct Proposal {
-    body @0 :Data;
-    sign @1 :Signature;
-}
-
 struct Acknowledgement {
+    hash @0 :Data;
+    sign @1 :Signature;
+}
+
+struct FallbackAlertBody {
+    unackedProposals @0 :List(Data);
+}
+
+struct ProposalStatusRequest {
     proposalHash @0 :Data;
-    sign @1 :Signature;
+    idx @1 :UInt16;
 }
 
-struct QuorumCertificate {
-    response @0 :ResponseBody;
-    signs @1 :List(Signature);
-}
-
-struct Redirect {
-    redirect @0 :UInt16;
-}
-
-struct FallbackAlert {
-    unackedProposal @0 :Data;
-    sign @1 :Signature;
-}
-
-struct QuorumDropRequest {
-    proof @0 :List(FallbackAlert);
-    reqId @1 :UInt64;
-}
-
-struct QuorumDropResponse {
-    reqId @0 :UInt64;
-    dropSecret @1 :Data;
+struct ProposalStatusResponseBody {
+    proposalHash @0 :Data;
+    union {
+        acks @1 :List(Signature);
+        notEnoughAcks @2 :UInt8;
+    }
 }
 
 struct Recovery {
-    proof @0 :List(FallbackAlert);
+    alerts @0 :List(SignedMessage);
     union {
-        quorumCertificate @1 :QuorumCertificate;
-        clientResponses @2 :List(ClientResponse);
+        enoughAcks @1 :EnoughAcksRecovery;
+        notEnoughAcks @2 :NotEnoughAcksRecovery;
     }
-    struct ClientResponse {
-        reqId @0 :UInt64;
-        dropSecret @1 :Data;
+    struct EnoughAcksRecovery {
+        ackedPart @0 :List(List(SignedMessage));
+        unackedPart @1 :List(List(SignedMessage));
+    }
+    struct NotEnoughAcksRecovery {
+        psrs @0 :List(List(SignedMessage));
     }
 }
 
-struct NetworkStatusRequest {
-    idx @0 :UInt16;
-}
-
-struct NetworkStatusResponse {
-    currentLeader @0 :UInt16;
+struct RecoveryAck {
+    recoveryHash @0 :Data;
+    sign @1 :Signature;
 }
 
 struct ResendChainRequest {
@@ -93,5 +85,5 @@ struct ResendChainRequest {
 }
 
 struct ResendChainResponse {
-    chainPart @0 :List(Proposal);
+    chainPart @0 :List(SignedMessage);
 }

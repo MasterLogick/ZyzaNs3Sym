@@ -6,35 +6,33 @@
 #include <cstdint>
 #include <span>
 
-namespace zyza
-{
-class Endpoint
-{
-  public:
-    explicit Endpoint(ns3::Ptr<ns3::Node> thisNode);
+namespace zyza {
+class Endpoint {
+public:
+  explicit Endpoint(ns3::Ptr<ns3::Node> thisNode);
 
-    void run();
+  void run();
 
-    ~Endpoint();
+  ~Endpoint();
 
-  protected:
-    virtual void onListeningStart() = 0;
+protected:
+  virtual void onListeningStart() = 0;
 
-    virtual void onTcpMessage(std::span<const uint8_t> message) = 0;
+  virtual void onTcpMessage(std::span<const uint8_t> message) = 0;
 
-    virtual void onUdpMessage(std::span<const uint8_t> message) = 0;
+  virtual void onUdpMessage(std::span<const uint8_t> message) = 0;
 
-    ns3::Ptr<ns3::Socket> serverUdpSocket;
+  ns3::Ptr<ns3::Socket> serverUdpSocket;
 
-    size_t recvStatistics = 0;
-    size_t recvMsgSize = 0;
+  size_t recvStatistics = 0;
+  size_t recvMsgSize = 0;
 
-  private:
-    ns3::Ptr<ns3::Node> thisNode;
-    ns3::Ptr<ns3::Socket> serverTcpSocket;
-    std::set<ns3::Ptr<ns3::Socket>> acceptedSockets;
-    bool inDestructor;
-    std::shared_ptr<int> lifetimePointer;
+private:
+  ns3::Ptr<ns3::Node> thisNode;
+  ns3::Ptr<ns3::Socket> serverTcpSocket;
+  std::set<ns3::Ptr<ns3::Socket>> acceptedSockets;
+  bool inDestructor;
+  std::shared_ptr<int> lifetimePointer;
 };
 } // namespace zyza
 
