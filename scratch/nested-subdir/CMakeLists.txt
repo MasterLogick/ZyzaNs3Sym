@@ -15,9 +15,9 @@ set(SECP256K1_BUILD_EXHAUSTIVE_TESTS OFF)
 set(SECP256K1_BUILD_CTIME_TESTS OFF)
 set(SECP256K1_BUILD_EXAMPLES OFF)
 FetchContent_Declare(
-        libsecp256l1
+        libsecp256k1
         GIT_REPOSITORY https://github.com/bitcoin-core/secp256k1.git
-        GIT_TAG e3a885d42a7800c1ccebad94ad1e2b82c4df5c65
+        GIT_TAG 0cdc758a56360bf58a851fe91085a327ec97685a
         GIT_SHALLOW TRUE
 )
 
@@ -33,7 +33,7 @@ FetchContent_Declare(
         GIT_SHALLOW TRUE
 )
 
-FetchContent_MakeAvailable(CapnProto libsecp256l1 uvw)
+FetchContent_MakeAvailable(CapnProto libsecp256k1 uvw)
 
 
 capnp_generate_cpp(zyzaCapnpSources zyzaCapnpHeaders lib/zyza.capnp)

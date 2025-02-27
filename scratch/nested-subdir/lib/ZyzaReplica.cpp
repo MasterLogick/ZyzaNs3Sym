@@ -16,13 +16,14 @@ namespace zyza {
 NS_LOG_COMPONENT_DEFINE("ZyzaReplica");
 
 ZyzaReplica::ZyzaReplica(
-    int nodesCount, int idx, ns3::PointToPointStarHelper &p2psh,
+    int nodesCount, int cancelersPerProposal, int idx,
+    ns3::PointToPointStarHelper &p2psh,
     std::vector<std::vector<uint8_t>> &serializedPublicKeys,
     std::span<const uint8_t> privateKey,
     std::chrono::milliseconds fallbackTimeout)
     : Endpoint(p2psh.GetSpokeNode(idx)),
-      ZyzaCommon(nodesCount, serializedPublicKeys), idx(idx),
-      alertTimeout(fallbackTimeout), currentFastPathLeader(0),
+      ZyzaCommon(nodesCount, cancelersPerProposal, serializedPublicKeys),
+      idx(idx), alertTimeout(fallbackTimeout), currentFastPathLeader(0),
       currentBackupPathLeader(0), initPassed(false), backupFastPathTimeout(),
       proposalOrd(0), p2psh(p2psh) {
   assert(privateKey.size() == 32);
@@ -64,27 +65,24 @@ void ZyzaReplica::onTcpMessage(std::span<const uint8_t> message) {
       {reinterpret_cast<const capnp::word *>(content.data()),
        content.size() / 8});
   switch (messageType) {
-  case MessageType::NEW_PROPOSAL:
-    processProposal(reader.getRoot<proto::SignedMessage>(), true);
+  case MessageType::PROPOSAL:
+    processProposal(reader.getRoot<proto::Proposal>());
     break;
   case MessageType::PROPOSAL_ACK:
     processAcknowledgement(reader.getRoot<proto::Acknowledgement>());
     break;
-  case MessageType::PROPOSAL_KEEP_REQUEST:
-    processProposalKeepRequest(reader.getRoot<proto::Acknowledgement>());
-    break;
   case MessageType::FALLBACK_ALERT:
     processFallbackAlert(reader.getRoot<proto::SignedMessage>());
     break;
-  case MessageType::PROPOSAL_STATUS_REQUEST:
-    processProposalStatusRequest(
-        reader.getRoot<proto::ProposalStatusRequest>());
+  case MessageType::PROPOSAL_CANCEL_REQUEST:
+    processProposalCancelRequest(
+        reader.getRoot<proto::SignedMessage>());
     break;
-  case MessageType::PROPOSAL_STATUS_RESPONSE:
-    processProposalStatusResponse(reader.getRoot<proto::SignedMessage>());
+  case MessageType::PROPOSAL_CANCEL_RESPONSE:
+    processProposalCancelResponse(reader.getRoot<proto::SignedMessage>());
     break;
   case MessageType::RECOVERY:
-    processRecovery(reader.getRoot<proto::Recovery>());
+    processRecovery(reader.getRoot<proto::SignedMessage>());
     break;
   case MessageType::RECOVERY_ACK:
     processRecoveryAck(reader.getRoot<proto::RecoveryAck>());
@@ -119,6 +117,9 @@ void ZyzaReplica::onUdpMessage(std::span<const uint8_t> message) {
   case MessageType::REQUEST:
     processRequest(reader.getRoot<proto::Request>());
     break;
+  case MessageType::CLIENT_RESPONSE:
+    processClientResponse(reader.getRoot<proto::ClientResponse>());
+    break;
   default:
     break;
   }
@@ -126,6 +127,12 @@ void ZyzaReplica::onUdpMessage(std::span<const uint8_t> message) {
 
 void ZyzaReplica::processRequest(const proto::Request::Reader &request) {
   if (currentState == ReplicaState::LEADER_FAST) {
+    for (auto &req : pendingRequests) {
+      if (req->getRoot<proto::Request>().getId() == request.getId()) {
+        std::clog << "got request with existing id" << std::endl;
+        return;
+      }
+    }
     pendingRequests.emplace_back(new capnp::MallocMessageBuilder())
         ->setRoot(request);
     onRequestAccepted();
@@ -138,69 +145,130 @@ void ZyzaReplica::processRequest(const proto::Request::Reader &request) {
   }
 }
 
-void ZyzaReplica::processProposal(const proto::SignedMessage::Reader &proposal,
-                                  bool checkSigner) {
+void ZyzaReplica::processClientResponse(
+    const proto::ClientResponse::Reader &reader) {
+  bool isACanceler = false;
+  if (reader.getProposalHash().size() != 32) {
+    std::clog << "wrong proposal hash size" << std::endl;
+    return;
+  }
+  for (const auto &nodeIdx :
+       getProposalCancelers(reader.getProposalHash().begin())) {
+    if (nodeIdx == idx) {
+      isACanceler = true;
+    }
+  }
+  if (!isACanceler) {
+    std::clog << "wrong client response destination" << std::endl;
+    return;
+  }
+  if (reader.which() == proto::ClientResponse::COMPLETED) {
+    for (const auto &item : reader.getCompleted()) {
+      if (item.getSign().size() != 64) {
+        std::clog << "wrong sign size" << std::endl;
+        return;
+      }
+    }
+  }
+  for (auto &pendingRequest : pendingProposalCancelRequests) {
+    if (memcmp(pendingRequest.proposalHash, reader.getProposalHash().begin(),
+               32) != 0) {
+      continue;
+    }
+    if (pendingRequest.clientResponses.contains(reader.getId())) {
+      std::clog << "already has client response" << std::endl;
+      return;
+    }
+    pendingRequest.clientResponses
+        .emplace(reader.getId(),
+                 std::make_unique<capnp::MallocMessageBuilder>())
+        .first->second->setRoot(reader);
+    if (pendingRequest.clientResponses.size() == pendingRequest.clientCount) {
+      for (const auto &nodeIdx : pendingRequest.reporters) {
+        sendProposalCancelResponse(pendingRequest, nodeIdx);
+      }
+    }
+    return;
+  }
+  auto &pendingRequest = pendingProposalCancelRequests.emplace_back();
+  memcpy(pendingRequest.proposalHash, reader.getProposalHash().begin(), 32);
+  pendingRequest.clientResponses
+      .emplace(reader.getId(), std::make_unique<capnp::MallocMessageBuilder>())
+      .first->second->setRoot(reader);
+}
+
+void ZyzaReplica::processProposal(const proto::Proposal::Reader &proposal) {
   if (currentState != ReplicaState::BACKUP_FAST) {
     return;
   }
-  int expectedSigner;
-  if (checkSigner) {
-    if (initPassed) {
-      expectedSigner = currentFastPathLeader;
-    } else {
-      expectedSigner = 0;
+  for (const auto &ackList : proposal.getAcknowledgements()) {
+    if (pendingChain.empty()) {
+      std::clog << "got acks for unknown proposal" << std::endl;
+      return;
     }
-  } else {
-    expectedSigner = -1;
+    if (!validateAckList(pendingChain.front().proposalHash, ackList)) {
+      return;
+    }
+    auto &acceptedProposal =
+        acceptedChain.emplace_back(std::move(pendingChain.front()));
+    for (const auto &sign : ackList) {
+      memcpy(acceptedProposal.acks[sign.getIdx()], sign.getSign().begin(), 64);
+    }
+    pendingProposals.pop_front();
+    std::clog << "processed ack list" << std::endl;
   }
-  if (!validateProposal(proposal, pendingChain.back().first, expectedSigner,
-                        initPassed, proposalOrd,
-                        maxPendingChainLength == pendingChain.size(),
-                        pendingChain)) {
+  if (pendingProposals.size() == maxPendingChainLength) {
+    std::clog << "pending tail size is too long" << std::endl;
+    return;
+  }
+  capnp::FlatArrayMessageReader proposalSignedMessageReader(
+      {reinterpret_cast<const capnp::word *>(
+           proposal.getSignedProposal().begin()),
+       proposal.getSignedProposal().size() / sizeof(capnp::word)});
+  auto proposalSignedMessage =
+      proposalSignedMessageReader.getRoot<proto::SignedMessage>();
+  if (!validateProposal(proposalSignedMessage, pendingChain.back().proposalHash,
+                        initPassed ? currentFastPathLeader : 0, initPassed)) {
     return;
   }
   capnp::FlatArrayMessageReader bodyMessage(
-      {reinterpret_cast<const capnp::word *>(proposal.getBody().begin()),
-       proposal.getBody().size() / 8});
+      {reinterpret_cast<const capnp::word *>(
+           proposalSignedMessage.getBody().begin()),
+       proposalSignedMessage.getBody().size() / 8});
   auto body = bodyMessage.getRoot<proto::ProposalBody>();
   std::clog << idx << ": got valid proposal with ord " << body.getOrd()
             << std::endl;
-  if (initPassed) {
-    for (const auto &item : body.getAcknowledgements()) {
-      auto &d = acceptedChain.emplace_back();
-      auto &s = pendingChain.front();
-      memcpy(d.first, s.first, 32);
-      d.second.setRoot(s.second.getRoot<proto::SignedMessage>().asReader());
-      pendingChain.pop_front();
-    }
-  }
   uint8_t newProposalHash[32];
-  SHA256(proposal.getBody().asBytes().begin(),
-         proposal.getBody().asBytes().size(), newProposalHash);
-  //  hexdump(proposalHash, "received proposal body hash");
+  SHA256(proposal.getSignedProposal().asBytes().begin(),
+         proposal.getSignedProposal().asBytes().size(), newProposalHash);
   {
     auto &pendingBlock = pendingChain.emplace_back();
-    memcpy(pendingBlock.first, newProposalHash, 32);
-    pendingBlock.second.setRoot(proposal);
+    memcpy(pendingBlock.proposalHash, newProposalHash, 32);
+    pendingBlock.proposal.assign(
+        proposalSignedMessage.getBody().asBytes().begin(),
+        proposalSignedMessage.getBody().asBytes().end());
   }
   for (const auto &item : body.getRequests()) {
     responseToClient(item, newProposalHash);
   }
-  uint8_t compressedSig[64];
-  signData(newProposalHash, compressedSig);
-  capnp::MallocMessageBuilder ackBuilder;
-  auto ack = ackBuilder.initRoot<proto::Acknowledgement>();
-  ack.setHash({newProposalHash, 32});
-  ack.getSign().setSign({compressedSig, 64});
-  ack.getSign().setIdx(idx);
-  sendToNode(currentFastPathLeader, MessageType::PROPOSAL_ACK, ackBuilder);
-  for (const auto &nodeIdx : getProposalKeepers(newProposalHash)) {
-    sendToNode(nodeIdx, MessageType::PROPOSAL_KEEP_REQUEST, ackBuilder);
+  auto cancelers = getProposalCancelers(newProposalHash);
+  if (!cancelers.contains(idx)) {
+    uint8_t compressedSig[64];
+    signData(newProposalHash, compressedSig);
+    capnp::MallocMessageBuilder ackBuilder;
+    auto ack = ackBuilder.initRoot<proto::Acknowledgement>();
+    ack.setProposalHash({newProposalHash, 32});
+    ack.getSign().setSign({compressedSig, 64});
+    ack.getSign().setIdx(idx);
+    sendToNode(currentFastPathLeader, MessageType::PROPOSAL_ACK, ackBuilder);
+    for (const auto &nodeIdx : cancelers) {
+      sendToNode(nodeIdx, MessageType::PROPOSAL_ACK, ackBuilder);
+    }
   }
   backupFastPathTimeout.Cancel();
   backupFastPathTimeout = ns3::Simulator::Schedule(
       ns3::Time::From(alertTimeout.count(), ns3::Time::MS),
-      [this] { handleBackupFastPathTimeout(); });
+      [this] { handleTimeout(); });
   initPassed = true;
   proposalOrd++;
   std::clog << "processed proposal" << std::endl;
@@ -211,7 +279,7 @@ void ZyzaReplica::processAcknowledgement(
   if (currentState != ReplicaState::LEADER_FAST) {
     return;
   }
-  if (reader.getHash().size() != 32) {
+  if (reader.getProposalHash().size() != 32) {
     std::clog << "wrong ack proposal hash size" << std::endl;
     return;
   }
@@ -219,22 +287,35 @@ void ZyzaReplica::processAcknowledgement(
     std::clog << "wrong ack proposal sign size" << std::endl;
     return;
   }
-  bool validSign = validateData(
-      std::span<const uint8_t, 32>{reader.getHash().begin(), 64},
-      std::span<const uint8_t, 64>{reader.getSign().getSign().begin(), 64},
-      reader.getSign().getIdx());
-  if (!validSign) {
+  if (!verifyData(reader.getProposalHash().begin(),
+                  reader.getSign().getSign().begin(),
+                  reader.getSign().getIdx())) {
     std::clog << "wrong ack proposal sign" << std::endl;
     return;
   }
-  for (auto &item : pendingProposals) {
-    if (memcmp(item.blockHash, reader.getHash().begin(), 32) != 0) {
+  for (auto &proposal : pendingProposals) {
+    if (memcmp(proposal.proposalHash, reader.getProposalHash().begin(), 32) !=
+        0) {
       continue;
     }
-    if (item.acks.size() == quorumSize) {
-      return;
+    auto cancelers = getProposalCancelers(proposal.proposalHash);
+    if (cancelers.contains(reader.getSign().getIdx())) {
+      if (proposal.acks.size() == quorumSize) {
+        return;
+      }
+    } else {
+      int collectedCancelerAcks = 0;
+      for (const auto &nodeIdx : cancelers) {
+        if (proposal.acks.contains(nodeIdx)) {
+          collectedCancelerAcks++;
+        }
+      }
+      if (proposal.acks.size() - collectedCancelerAcks ==
+          quorumSize - cancelersPerProposal) {
+        return;
+      }
     }
-    memcpy(item.acks[reader.getSign().getIdx()],
+    memcpy(proposal.acks[reader.getSign().getIdx()],
            reader.getSign().getSign().begin(), 64);
     std::clog << "processed ack" << std::endl;
     break;
@@ -242,30 +323,6 @@ void ZyzaReplica::processAcknowledgement(
   if (pendingProposals.begin()->acks.size() == quorumSize) {
     onPendingBlockAcksReady();
   }
-  hexdump(reader.getHash().begin(), "unknown ack proposal hash");
-}
-
-void ZyzaReplica::processProposalKeepRequest(
-    const proto::Acknowledgement::Reader &proposalKeepRequest) {
-  if (proposalKeepRequest.getHash().size() != 32) {
-    std::clog << "wrong ack proposal hash size" << std::endl;
-    return;
-  }
-  if (proposalKeepRequest.getSign().getSign().size() != 64) {
-    std::clog << "wrong ack proposal sign size" << std::endl;
-    return;
-  }
-  if (!validateData(
-          std::span<const uint8_t, 32>{proposalKeepRequest.getHash().begin(),
-                                       32},
-          std::span<const uint8_t, 64>{
-              proposalKeepRequest.getSign().getSign().begin(), 64},
-          proposalKeepRequest.getSign().getIdx())) {
-    return;
-  }
-  keptProposalAcks
-      .emplace_back(std::make_unique<capnp::MallocMessageBuilder>())
-      ->setRoot(proposalKeepRequest);
 }
 
 void ZyzaReplica::processFallbackAlert(
@@ -273,99 +330,160 @@ void ZyzaReplica::processFallbackAlert(
   if (currentState != ReplicaState::LEADER_FALLBACK) {
     return;
   }
-  capnp::FlatArrayMessageReader unackedProposalBodyReader(
+  if (!verifySignedMessage(fallbackAlert)) {
+    return;
+  }
+  capnp::FlatArrayMessageReader signedMessageReader(
+      {reinterpret_cast<const capnp::word *>(fallbackAlert.getBody().begin()),
+       fallbackAlert.getBody().size() / 8});
+  auto fallbackAlertBody =
+      signedMessageReader.getRoot<proto::FallbackAlertBody>();
+  if (fallbackAlertBody.getLastAckedProposalHash().size() != 32) {
+    std::clog << "wrong fallback alert last acked proposal hash size"
+              << std::endl;
+    return;
+  }
+  if (memcmp(fallbackAlertBody.getLastAckedProposalHash().begin(),
+             acceptedChain.back().proposalHash, 32) != 0) {
+    std::clog << "wrong fallback alert last acked proposal hash" << std::endl;
+    capnp::MallocMessageBuilder resendChainRequestBuilder;
+    auto resendChainRequest =
+        resendChainRequestBuilder.initRoot<proto::ResendChainRequest>();
+    resendChainRequest.setIdx(fallbackAlert.getSign().getIdx());
+    resendChainRequest.setLastAckedProposalHash(
+        fallbackAlertBody.getLastAckedProposalHash());
+    processResendChainRequest(resendChainRequest);
+    return;
+  }
+  capnp::MallocMessageBuilder resendChainResponseBuilder;
+  auto resendChainResponse =
+      resendChainResponseBuilder.initRoot<proto::ResendChainResponse>();
+  resendChainResponse.setProposals(
+      fallbackAlertBody.getUnackedSignedProposals());
+  resendChainResponse.initAcknowledgements(0);
+  if (!validateResendChainResponse(resendChainResponse)) {
+    return;
+  }
+  int i = 0;
+  for (const auto &proposal : fallbackAlertBody.getUnackedSignedProposals()) {
+    capnp::FlatArrayMessageReader proposalSignedMessageReader(
+        {reinterpret_cast<const capnp::word *>(proposal.begin()),
+         proposal.size() / 8});
+    auto proposalSignedMessage =
+        proposalSignedMessageReader.getRoot<proto::SignedMessage>();
+    capnp::FlatArrayMessageReader proposalBodyReader(
+        {reinterpret_cast<const capnp::word *>(
+             proposalSignedMessage.getBody().begin()),
+         proposalSignedMessage.getBody().size() / 8});
+    auto proposalBody = proposalBodyReader.getRoot<proto::ProposalBody>();
+
+  }
+}
+
+void ZyzaReplica::processProposalCancelRequest(
+    const proto::SignedMessage::Reader &proposalCancelRequest) {
+  if (proposalCancelRequest.getIdx() >= nodesCount) {
+    std::clog << "wrong node idx" << std::endl;
+    return;
+  }
+  uint8_t proposalHash[32];
+  SHA256(proposalCancelRequest.getSignedProposal().asBytes().begin(),
+         proposalCancelRequest.getSignedProposal().asBytes().size(),
+         proposalHash);
+  auto it = pendingProposalCancelRequests.begin();
+  std::map<uint64_t, std::unique_ptr<capnp::MallocMessageBuilder>>
+      clientResponses;
+  std::set<uint16_t> reporters;
+  while (it != pendingProposalCancelRequests.end()) {
+    auto &pendingRequest = *it;
+    if (memcmp(pendingRequest.proposalHash, proposalHash, 32) == 0) {
+      if (pendingRequest.clientCount == 0) {
+        clientResponses = std::move(pendingRequest.clientResponses);
+        reporters = std::move(pendingRequest.reporters);
+        pendingProposalCancelRequests.erase(it);
+        break;
+      }
+      if (pendingRequest.clientResponses.size() == pendingRequest.clientCount) {
+        sendProposalCancelResponse(pendingRequest,
+                                   proposalCancelRequest.getIdx());
+      } else {
+        pendingRequest.reporters.insert(proposalCancelRequest.getIdx());
+      }
+      return;
+    }
+  }
+  if (!getProposalCancelers(proposalHash).contains(idx)) {
+    std::clog << "this node is not a canceler for provided proposal"
+              << std::endl;
+    return;
+  }
+  capnp::FlatArrayMessageReader proposalSignedMessageReader(
       {reinterpret_cast<const capnp::word *>(
-           fallbackAlert.getUnackedProposal().begin()),
-       fallbackAlert.getUnackedProposal().size() / 8});
-  auto proposal = unackedProposalBodyReader.getRoot<proto::Proposal>();
-  auto myUnackedProposal =
-      pendingChain.front().second.getRoot<proto::Proposal>();
-  if (!validateProposal(proposal, acceptedChain.back().first,
-                        myUnackedProposal.getSign().getIdx(), true,
-                        currentFastPathLeader, )) {
+           proposalCancelRequest.getSignedProposal().begin()),
+       proposalCancelRequest.getSignedProposal().size() / sizeof(capnp::word)});
+  auto proposalSignedMessage =
+      proposalSignedMessageReader.getRoot<proto::SignedMessage>();
+  if (!validateProposal(proposalSignedMessage, nullptr, -1, -1)) {
     return;
   }
-  uint8_t hash[32];
-  SHA256(fallbackAlert.getUnackedProposal().begin(),
-         fallbackAlert.getUnackedProposal().size(), hash);
-  secp256k1_ecdsa_signature sig;
-  int rc = secp256k1_ecdsa_signature_parse_compact(
-      secpCtx, &sig, fallbackAlert.getSign().getSign().begin());
-  if (!rc) {
-    std::clog << "wrong fallback alert packed sign" << std::endl;
+  capnp::FlatArrayMessageReader proposalBodyReader(
+      {reinterpret_cast<const capnp::word *>(
+           proposalSignedMessage.getBody().begin()),
+       proposalSignedMessage.getBody().size() / sizeof(capnp::word)});
+  auto proposalBody = proposalBodyReader.getRoot<proto::ProposalBody>();
+  if (proposalBody.getRequests().size() !=
+      proposalCancelRequest.getSignatures().size()) {
+    std::clog << "wrong cancel request signatures list size" << std::endl;
     return;
   }
-  rc = secp256k1_ecdsa_verify(secpCtx, &sig, hash,
-                              &publicKeys[fallbackAlert.getSign().getIdx()]);
-  if (!rc) {
-    std::clog << "wrong fallback alert sign" << std::endl;
-    return;
+  std::vector<std::unique_ptr<capnp::MallocMessageBuilder>> cancelRequests;
+  for (int i = 0; i < proposalBody.getRequests().size(); ++i) {
+    auto request = proposalBody.getRequests()[i];
+    auto requestCancel =
+        cancelRequests
+            .emplace_back(std::make_unique<capnp::MallocMessageBuilder>())
+            ->initRoot<proto::RequestCancel>();
+    requestCancel.setId(request.getId());
+    requestCancel.setProposalHash({proposalHash, 32});
+    uint8_t cancelProof[8 + 32];
+    *reinterpret_cast<uint64_t *>(cancelProof) = request.getId();
+    memcpy(cancelProof + 8, proposalHash, 32);
+    uint8_t cancelHash[32];
+    SHA256(cancelProof, 8 + 32, cancelHash);
+    if (proposalCancelRequest.getSignatures()[i].size() != quorumSize) {
+      std::clog << "wrong signature list size" << std::endl;
+    }
+    for (const auto &sign : proposalCancelRequest.getSignatures()[i]) {
+      if (sign.getSign().size() != 64) {
+        std::clog << "wrong sign size" << std::endl;
+        return;
+      }
+      if (!verifyData(cancelHash, sign.getSign().begin(), sign.getIdx())) {
+        std::clog << "wrong sign" << std::endl;
+        return;
+      }
+    }
+    requestCancel.setSignatures(proposalCancelRequest.getSignatures()[i]);
   }
-  std::unique_ptr<capnp::MallocMessageBuilder> mb(
-      new capnp::MallocMessageBuilder());
-  mb->setRoot(fallbackAlert);
-  acceptedFallbackAlerts[fallbackAlert.getSign().getIdx()] = std::move(mb);
-  std::clog << "accepted fallback alert" << std::endl;
-  if (acceptedFallbackAlerts.size() == quorumSize) {
-    std::clog << "approved force switching to fallback" << std::endl;
-    sendDropRequests();
+  auto &pendingCancelRequest = pendingProposalCancelRequests.emplace_back();
+  memcpy(pendingCancelRequest.proposalHash, proposalHash, 32);
+  pendingCancelRequest.reporters = std::move(reporters);
+  pendingCancelRequest.reporters.insert(proposalCancelRequest.getIdx());
+  pendingCancelRequest.clientResponses = std::move(clientResponses);
+  pendingCancelRequest.clientCount = proposalBody.getRequests().size();
+  for (int i = 0; i < proposalBody.getRequests().size(); ++i) {
+    auto request = proposalBody.getRequests()[i];
+    sendToClient(request.getRespAddr(), request.getRespPort(),
+                 MessageType::REQUEST_CANCEL, *cancelRequests[i]);
   }
 }
 
-void ZyzaReplica::processProposalStatusRequest(
-    const proto::ProposalStatusRequest::Reader &proposalStatusRequest) {
-  if (proposalStatusRequest.getProposalHash().size() != 32) {
-    std::clog << "wrong proposal status request hash size" << std::endl;
-    return;
-  }
-  if (proposalStatusRequest.getIdx() >= nodesCount) {
-    std::clog << "wrong proposal status request idx" << std::endl;
-    return;
-  }
-  std::map<uint16_t, uint8_t[64]> signatures;
-  for (const auto &item : keptProposalAcks) {
-    auto reader = item->getRoot<proto::Acknowledgement>();
-    if (memcmp(reader.getHash().begin(),
-               proposalStatusRequest.getProposalHash().begin(), 32) == 0) {
-      memcpy(signatures[reader.getSign().getIdx()],
-             reader.getSign().getSign().begin(), 64);
-    }
-    if (signatures.size() == quorumSize) {
-      break;
-    }
-  }
-  capnp::MallocMessageBuilder proposalStatusResponseBodyBuilder;
-  auto proposalStatusResponseBody =
-      proposalStatusResponseBodyBuilder
-          .initRoot<proto::ProposalStatusResponseBody>();
-  proposalStatusResponseBody.setProposalHash(
-      proposalStatusRequest.getProposalHash());
-  if (signatures.size() == quorumSize) {
-    auto acks = proposalStatusResponseBody.initAcks(quorumSize);
-    int i = 0;
-    for (const auto &[nodeIdx, sign] : signatures) {
-      acks[i].setIdx(nodeIdx);
-      acks[i].setSign({sign, 64});
-      i++;
-    }
-  } else {
-    proposalStatusResponseBody.setNotEnoughAcks(0);
-  }
-  capnp::MallocMessageBuilder responseBuilder;
-  createSignedMessage(proposalStatusResponseBodyBuilder, responseBuilder);
-  sendToNode(proposalStatusRequest.getIdx(),
-             MessageType::PROPOSAL_STATUS_RESPONSE, responseBuilder);
+void ZyzaReplica::processProposalCancelResponse(
+    const proto::SignedMessage::Reader &proposalCancelResponse) {
+  -- --;
 }
 
-void ZyzaReplica::processProposalStatusResponse(
-    const proto::SignedMessage::Reader &proposalStatusRequest) {
-  if (currentState != ReplicaState::LEADER_FALLBACK) {
-    return;
-  }
-  -- -- -;
-}
-
-void ZyzaReplica::processRecovery(const proto::Recovery::Reader &recovery) {
+void ZyzaReplica::processRecovery(const proto::SignedMessage::Reader &recovery) {
   assert(initPassed);
   uint16_t expectedLeader = 0;
   uint8_t expectedHash[32];
@@ -399,7 +517,7 @@ void ZyzaReplica::processRecovery(const proto::Recovery::Reader &recovery) {
       std::clog << "wrong recovery proof proposal" << std::endl;
       return;
     }
-    if (!validateData(item.getUnackedProposal(), item.getSign())) {
+    if (!verifyData(item.getUnackedProposal(), item.getSign())) {
       std::clog << "wrong recovery proof sign" << std::endl;
       return;
     }
@@ -485,7 +603,7 @@ void ZyzaReplica::processRecoveryAck(
 
 void ZyzaReplica::processResendChainRequest(
     const proto::ResendChainRequest::Reader &nsr) {
-  if (nsr.getLastAckedProposal().size() != 32) {
+  if (nsr.getLastAckedProposalHash().size() != 32) {
     std::clog << "wrong resend chain proposal hash size" << std::endl;
     return;
   }
@@ -498,49 +616,53 @@ void ZyzaReplica::processResendChainRequest(
   }
   uint8_t zeroHash[32];
   memset(zeroHash, 0, 32);
-  if (memcmp(zeroHash, nsr.getLastAckedProposal().begin(), 32) == 0) {
-    resendChainPart(acceptedChain.begin(), nsr.getIdx(), acceptedChain.size());
-    return;
+  std::list<Proposal>::iterator pendingBegin;
+  std::list<Proposal>::iterator pendingEnd;
+  int pendingTotalSize;
+  if (currentState == ReplicaState::LEADER_FAST) {
+    pendingBegin = pendingProposals.begin();
+    pendingEnd = pendingProposals.end();
+    pendingTotalSize = pendingProposals.size();
   } else {
-    if (currentState == ReplicaState::LEADER_FAST) {
-      int acceptedChainPartSize = 0;
-      auto iter = pendingProposals.end();
-      while (iter != pendingProposals.begin()) {
-        iter--;
-        acceptedChainPartSize++;
-        if (memcmp(iter->blockHash, nsr.getLastAckedProposal().begin(), 32) ==
-            0) {
-          resendChainPart(acceptedChain.end(), nsr.getIdx(),
-                          acceptedChainPartSize);
-          return;
-        }
-      }
-    } else {
-      int acceptedChainPartSize = 0;
-      auto iter = pendingChain.end();
-      while (iter != pendingChain.begin()) {
-        iter--;
-        acceptedChainPartSize++;
-
-        if (memcmp(iter->first, nsr.getLastAckedProposal().begin(), 32) == 0) {
-          resendChainPart(acceptedChain.end(), nsr.getIdx(),
-                          acceptedChainPartSize);
-          return;
-        }
-      }
-    }
-    int acceptedChainPartSize = 0;
-    auto iter = acceptedChain.end();
-    while (iter != acceptedChain.begin()) {
-      iter--;
-      acceptedChainPartSize++;
-
-      if (memcmp(iter->first, nsr.getLastAckedProposal().begin(), 32) == 0) {
-        resendChainPart(iter, nsr.getIdx(), acceptedChainPartSize);
+    pendingBegin = pendingChain.begin();
+    pendingEnd = pendingChain.end();
+    pendingTotalSize = pendingChain.size();
+  }
+  if (memcmp(zeroHash, nsr.getLastAckedProposalHash().begin(), 32) == 0) {
+    resendChainPart(nsr.getIdx(), acceptedChain.begin(), acceptedChain.size(),
+                    pendingBegin, pendingTotalSize);
+    return;
+  }
+  int pendingSize = 0;
+  if (pendingBegin != pendingEnd) {
+    do {
+      pendingEnd--;
+      pendingSize++;
+      if (memcmp(pendingEnd->proposalHash,
+                 nsr.getLastAckedProposalHash().begin(), 32) == 0) {
+        pendingEnd++;
+        pendingSize--;
+        resendChainPart(nsr.getIdx(), acceptedChain.end(), 0, pendingEnd,
+                        pendingSize);
         return;
       }
-    }
-    resendChainPart(acceptedChain.end(), nsr.getIdx(), 0);
+    } while (pendingBegin != pendingEnd);
+  }
+  int acceptedSize = 0;
+  auto acceptedEnd = acceptedChain.begin();
+  if (acceptedChain.begin() != acceptedEnd) {
+    do {
+      pendingEnd--;
+      acceptedSize++;
+      if (memcmp(acceptedEnd->proposalHash,
+                 nsr.getLastAckedProposalHash().begin(), 32) == 0) {
+        acceptedEnd++;
+        acceptedSize--;
+        resendChainPart(nsr.getIdx(), acceptedEnd, acceptedSize, pendingBegin,
+                        pendingTotalSize);
+        return;
+      }
+    } while (acceptedChain.begin() != acceptedEnd);
   }
 }
 
@@ -549,38 +671,86 @@ void ZyzaReplica::processResendChainResponse(
   if (currentState != ReplicaState::BACKUP_FALLBACK) {
     return;
   }
-  auto chainPart = nsr.getChainPart();
-  if (chainPart.size() == 0) {
+  if (!validateResendChainResponse(nsr)) {
     return;
   }
-  if (acceptedChain.empty() && chainPart.size() == 1) {
-    return;
-  }
-  auto it = chainPart.begin();
-  uint8_t zeroHash[32];
-  memset(zeroHash, 0, 32);
-  bool oldInitPassed = initPassed;
-  while (it != chainPart.end()) {
-    const uint8_t *expectedPrevHash =
-        initPassed ? pendingChain.back().first : zeroHash;
-    if (validateProposal(*it, expectedPrevHash, -1, initPassed, -1,
-                         pendingChain.size() == maxPendingChainLength,
-                         pendingChain)) {
+  auto proposalsIt = nsr.getProposals().begin();
+  auto proposalsEnd = nsr.getProposals().end();
+  auto acksIt = nsr.getAcknowledgements().begin();
+  auto acksEnd = nsr.getAcknowledgements().end();
+  proposalsIt = nsr.getProposals().begin();
+  acksIt = nsr.getAcknowledgements().begin();
+  auto pendingIt = pendingChain.begin();
+  auto pendingEnd = pendingChain.end();
+  bool appended = false;
+  while (proposalsIt != proposalsEnd && acksIt != acksEnd &&
+         pendingIt != pendingEnd) {
+    if (proposalsIt->size() != pendingIt->proposal.size() ||
+        memcmp(proposalsIt->begin(), pendingIt->proposal.data(),
+               proposalsIt->size()) != 0) {
+      pendingChain.clear();
+      appendTail(proposalsIt, proposalsEnd, acksIt, acksEnd);
+      appended = true;
       break;
     }
-    it++;
+    auto &newAcceptedProposal =
+        acceptedChain.emplace_back(std::move(pendingChain.front()));
+    pendingChain.pop_front();
+    for (const auto &item : *acksIt) {
+      memcpy(newAcceptedProposal.acks[item.getIdx()], item.getSign().begin(),
+             64);
+    }
   }
-  if (it == chainPart.end()) {
-    return;
+  if (pendingIt == pendingEnd) {
+    appendTail(proposalsIt, proposalsEnd, acksIt, acksEnd);
+    appended = true;
+  } else {
+    bool diverged = false;
+    while (proposalsIt != proposalsEnd && pendingIt != pendingEnd) {
+      if (proposalsIt->size() != pendingIt->proposal.size() ||
+          memcmp(proposalsIt->begin(), pendingIt->proposal.data(),
+                 proposalsIt->size()) != 0) {
+        diverged = true;
+        break;
+      }
+    }
+    if (!diverged) {
+      if (proposalsIt != proposalsEnd) {
+        appendTail(proposalsIt, proposalsEnd, acksIt, acksEnd);
+        appended = true;
+      }
+    }
   }
-  while (it != chainPart.end()) {
-    processProposal(*it, false);
+  if (appended) {
+    transitionToBackupFastPath();
   }
 }
 
-void ZyzaReplica::transitionToNextBackupLeader() {}
+void ZyzaReplica::transitionToNextBackupLeader() {
+  currentBackupPathLeader = (currentBackupPathLeader + 1) % nodesCount;
+  sendFallbackAlert(currentBackupPathLeader);
+  capnp::MallocMessageBuilder resendChainRequestBuilder;
+  auto resendChainRequest =
+      resendChainRequestBuilder.initRoot<proto::ResendChainRequest>();
+  resendChainRequest.setIdx(idx);
+  resendChainRequest.setLastAckedProposalHash(
+      {acceptedChain.back().proposalHash, 32});
+  int a = currentFastPathLeader;
+  while (a != currentBackupPathLeader) {
+    sendToNode(a, MessageType::RESEND_CHAIN_REQUEST, resendChainRequestBuilder);
+    a++;
+  }
+  if (currentState == ReplicaState::BACKUP_FAST) {
+    backupFastPathTimeout.Cancel();
+  }
+  currentState = ReplicaState::BACKUP_FALLBACK;
+  nextLeaderAlertTimerEvent.Cancel();
+  nextLeaderAlertTimerEvent = ns3::Simulator::Schedule(
+      ns3::Time::From(leaderSwitchTimeout.count(), ns3::Time::MS),
+      [this] { handleTimeout(); });
+}
 
-void ZyzaReplica::transitionToLeaderFallback() {
+void ZyzaReplica::transitionToLeaderFallbackPath() {
   if (currentState == ReplicaState::BACKUP_FAST) {
     backupFastPathTimeout.Cancel();
   } else if (currentState == ReplicaState::BACKUP_FALLBACK) {
@@ -588,7 +758,26 @@ void ZyzaReplica::transitionToLeaderFallback() {
     recoveryAcks.clear();
   }
   currentState = ReplicaState::LEADER_FALLBACK;
+  -- --;
+}
 
+void ZyzaReplica::transitionToBackupFastPath() {
+  currentState = ReplicaState::BACKUP_FAST;
+  capnp::FlatArrayMessageReader reader(
+      {reinterpret_cast<const capnp::word *>(
+           acceptedChain.back().proposal.data()),
+       acceptedChain.back().proposal.size() / 8});
+  currentFastPathLeader =
+      reader.getRoot<proto::SignedMessage>().getSign().getIdx();
+  backupFastPathTimeout.Cancel();
+  backupFastPathTimeout = ns3::Simulator::Schedule(
+      ns3::Time::From(alertTimeout.count(), ns3::Time::MS),
+      [this] { handleTimeout(); });
+
+  recoveryMessageBuilder = nullptr;
+  memset(recoveryMessageHash, 0, 32);
+  recoveryAcks.clear();
+  nextLeaderAlertTimerEvent.Cancel();
 }
 
 void ZyzaReplica::onPendingBlockAcksReady() {
@@ -607,7 +796,6 @@ void ZyzaReplica::onRequestAccepted() {
 }
 
 void ZyzaReplica::startNewRound() {
-  std::clog << "starting a new round" << std::endl;
   auto t = ns3::Simulator::Now();
   if (sumCount == 0) {
     start = ns3::Simulator::Now();
@@ -623,9 +811,37 @@ void ZyzaReplica::startNewRound() {
   sentStatistics = 0;
   recvStatistics = 0;
   last = t;
+
+  std::clog << "starting a new round" << std::endl;
   capnp::MallocMessageBuilder proposalBodyBuilder;
   auto proposalBody = proposalBodyBuilder.initRoot<proto::ProposalBody>();
-  proposalBody.setPrevProposalHash({pendingProposals.back().blockHash, 32});
+  proposalBody.setPrevProposalHash({pendingProposals.back().proposalHash, 32});
+  proposalBody.initRequests(pendingRequests.size());
+  for (int i = 0; i < pendingRequests.size(); ++i) {
+    proposalBody.getRequests().setWithCaveats(
+        i, pendingRequests[i]->getRoot<proto::Request>());
+  }
+  proposalBody.setOrd(proposalOrd);
+  proposalOrd++;
+  capnp::MallocMessageBuilder signedProposalBuilder;
+  createSignedMessage(proposalBodyBuilder, signedProposalBuilder);
+
+  auto signedProposal = signedProposalBuilder.getRoot<proto::SignedMessage>();
+  auto serializedSignedProposal =
+      capnp::messageToFlatArray(signedProposalBuilder);
+  uint8_t proposalHash[32];
+  SHA256(serializedSignedProposal.asBytes().begin(),
+         serializedSignedProposal.asBytes().size(), proposalHash);
+  hexdump(proposalHash, "new round proposal hash");
+
+  for (const auto &pendingRequest : pendingRequests) {
+    responseToClient(pendingRequest->getRoot<proto::Request>(), proposalHash);
+  }
+  pendingRequests.clear();
+
+  capnp::MallocMessageBuilder proposalBuilder;
+  auto proposal = proposalBuilder.initRoot<proto::Proposal>();
+  proposal.setSignedProposal(serializedSignedProposal.asBytes());
   {
     int acceptedProposals = 0;
     auto it = pendingProposals.begin();
@@ -637,11 +853,11 @@ void ZyzaReplica::startNewRound() {
       it++;
     }
     if (acceptedProposals != 0) {
-      proposalBody.initAcknowledgements(acceptedProposals);
+      proposal.initAcknowledgements(acceptedProposals);
     }
     it = pendingProposals.begin();
     for (int i = 0; i < acceptedProposals; ++i) {
-      auto d = proposalBody.getAcknowledgements().init(i, quorumSize);
+      auto d = proposal.getAcknowledgements().init(i, quorumSize);
       int j = 0;
       for (const auto &item : it->acks) {
         auto signature = d[j];
@@ -652,55 +868,24 @@ void ZyzaReplica::startNewRound() {
       it++;
     }
     for (int i = 0; i < acceptedProposals; ++i) {
-      auto &newBlock = acceptedChain.emplace_back();
-      memcpy(newBlock.first, pendingProposals.begin()->blockHash, 32);
-      newBlock.second.setRoot(pendingProposals.begin()
-                                  ->proposal.getRoot<proto::SignedMessage>()
-                                  .asReader());
+      acceptedChain.emplace_back(std::move(pendingProposals.front()));
+      pendingProposals.pop_front();
       initPassed = true;
     }
   }
-  proposalBody.initRequests(pendingRequests.size());
-  for (int i = 0; i < pendingRequests.size(); ++i) {
-    proposalBody.getRequests().setWithCaveats(
-        i, pendingRequests[i]->getRoot<proto::Request>());
-  }
-  proposalBody.setOrd(proposalOrd);
-  proposalOrd++;
-
-  auto newPendingProposal = pendingProposals.emplace({});
-  createSignedMessage(proposalBodyBuilder, newPendingProposal->proposal);
-  auto signedProposal =
-      newPendingProposal->proposal.getRoot<proto::SignedMessage>();
-  SHA256(signedProposal.getBody().asBytes().begin(),
-         signedProposal.getBody().asBytes().size(),
-         newPendingProposal->blockHash);
-  hexdump(newPendingProposal->blockHash, "new round proposal body hash");
-  signData(newPendingProposal->blockHash, newPendingProposal->acks[idx]);
-
-  for (const auto &pendingRequest : pendingRequests) {
-    responseToClient(pendingRequest->getRoot<proto::Request>(),
-                     newPendingProposal->blockHash);
-  }
-  pendingRequests.clear();
 
   for (int i = 0; i < nodesCount; ++i) {
     if (i == idx) {
       continue;
     }
-    sendToNode(i, MessageType::NEW_PROPOSAL, newPendingProposal->proposal);
+    sendToNode(i, MessageType::PROPOSAL, proposalBuilder);
   }
 
-  capnp::MallocMessageBuilder ackBuilder;
-  auto ack = ackBuilder.initRoot<proto::Acknowledgement>();
-  ack.setHash({newPendingProposal->blockHash, 32});
-  auto ackSign = ack.initSign();
-  ackSign.setIdx(idx);
-  ackSign.setSign({newPendingProposal->acks[idx], 64});
-  for (const auto &keeperIdx :
-       getProposalKeepers(newPendingProposal->blockHash)) {
-    sendToNode(keeperIdx, MessageType::PROPOSAL_KEEP_REQUEST, ackBuilder);
-  }
+  auto &newPendingProposal = pendingProposals.emplace_back();
+  memcpy(newPendingProposal.proposalHash, proposalHash, 32);
+  newPendingProposal.proposal.assign(serializedSignedProposal.asBytes().begin(),
+                                     serializedSignedProposal.asBytes().end());
+  signData(proposalHash, newPendingProposal.acks[idx]);
   std::clog << "started a new round" << std::endl;
 }
 
@@ -719,50 +904,195 @@ void ZyzaReplica::responseToClient(const proto::Request::Reader &request,
 }
 
 void ZyzaReplica::resendChainPart(
-    std::list<std::pair<uint8_t[32], capnp::MallocMessageBuilder>>::iterator
-        acceptedChainIter,
-    int node, int acceptedChainPartSize) {
+    int nodeIdx, std::list<Proposal>::iterator acceptedChainIter,
+    int acceptedChainPartSize, std::list<Proposal>::iterator pendingChainIter,
+    int pendingChainPartSize) {
   capnp::MallocMessageBuilder resendChainResponseBuilder;
   auto resendChainResponse =
       resendChainResponseBuilder.initRoot<proto::ResendChainResponse>();
-  int pendingChainSize;
-  if (currentState == ReplicaState::LEADER_FAST) {
-    pendingChainSize = pendingProposals.size();
-  } else {
-    pendingChainSize = pendingChain.size();
-  }
-  auto chainPart = resendChainResponse.initChainPart(acceptedChainPartSize +
-                                                     pendingChainSize);
+  auto proposals = resendChainResponse.initProposals(acceptedChainPartSize +
+                                                     pendingChainPartSize);
+  auto acks = resendChainResponse.initAcknowledgements(acceptedChainPartSize);
   int i = 0;
   while (acceptedChainIter != acceptedChain.end()) {
-    chainPart.setWithCaveats(
-        i, acceptedChainIter->second.getRoot<proto::SignedMessage>());
+    proposals.set(i, {acceptedChainIter->proposal.data(),
+                      acceptedChainIter->proposal.size()});
+    auto acksArr = acks.init(i, quorumSize);
+    int j = 0;
+    for (const auto &[nodeId, sig] : acceptedChainIter->acks) {
+      acksArr[j].setIdx(nodeId);
+      acksArr[j].setSign({sig, 64});
+    }
     i++;
     acceptedChainIter++;
   }
   if (currentState == ReplicaState::LEADER_FAST) {
-    for (auto &item : pendingProposals) {
-      chainPart.setWithCaveats(i,
-                               item.proposal.getRoot<proto::SignedMessage>());
+    while (pendingChainIter != pendingProposals.end()) {
+      proposals.set(i, {pendingChainIter->proposal.data(),
+                        pendingChainIter->proposal.size()});
       i++;
+      pendingChainIter++;
     }
   } else {
-    for (auto &item : pendingChain) {
-      chainPart.setWithCaveats(i, item.second.getRoot<proto::SignedMessage>());
+    while (pendingChainIter != pendingChain.end()) {
+      proposals.set(i, {pendingChainIter->proposal.data(),
+                        pendingChainIter->proposal.size()});
       i++;
+      pendingChainIter++;
     }
   }
-  sendToNode(node, MessageType::RESEND_CHAIN_RESPONSE,
+  sendToNode(nodeIdx, MessageType::RESEND_CHAIN_RESPONSE,
              resendChainResponseBuilder);
 }
 
-void ZyzaReplica::handleBackupFastPathTimeout() {
+void ZyzaReplica::sendProposalCancelResponse(
+    ZyzaReplica::PendingProposalCancelRequest &pendingRequest,
+    uint16_t nodeIdx) {
+  capnp::MallocMessageBuilder scrbBuilder;
+  auto pcrb = scrbBuilder.initRoot<proto::ProposalCancelResponseBody>();
+  pcrb.setProposalHash({pendingRequest.proposalHash, 32});
+  auto clientResponses = pcrb.initClientResponses(pendingRequest.clientCount);
+  auto it = pendingRequest.clientResponses.begin();
+  for (int i = 0; i < pendingRequest.clientCount; ++i) {
+    clientResponses.setWithCaveats(
+        i, it->second->getRoot<proto::ClientResponse>());
+    it++;
+  }
+  capnp::MallocMessageBuilder signedMessage;
+  createSignedMessage(scrbBuilder, signedMessage);
+  sendToNode(nodeIdx, MessageType::PROPOSAL_CANCEL_RESPONSE, signedMessage);
+}
+
+void ZyzaReplica::appendTail(
+    capnp::List<capnp::Data>::Reader::Iterator proposalsIt,
+    capnp::List<capnp::Data>::Reader::Iterator proposalsEnd,
+    capnp::List<capnp::List<proto::Signature>>::Reader::Iterator acksIt,
+    capnp::List<capnp::List<proto::Signature>>::Reader::Iterator acksEnd) {
+  while (proposalsIt != proposalsEnd && acksIt != acksEnd) {
+    auto &newAcceptedProposal = acceptedChain.emplace_back();
+    newAcceptedProposal.proposal.assign(proposalsIt->begin(),
+                                        proposalsIt->end());
+    SHA256(newAcceptedProposal.proposal.data(),
+           newAcceptedProposal.proposal.size(),
+           newAcceptedProposal.proposalHash);
+    for (const auto &item : *acksIt) {
+      memcpy(newAcceptedProposal.acks[item.getIdx()], item.getSign().begin(),
+             64);
+    }
+    capnp::FlatArrayMessageReader signedMessageReader(
+        {reinterpret_cast<const capnp::word *>(proposalsIt->begin()),
+         proposalsIt->size() / 8});
+    auto signedMessage = signedMessageReader.getRoot<proto::SignedMessage>();
+    capnp::FlatArrayMessageReader proposalBodyReader(
+        {reinterpret_cast<const capnp::word *>(signedMessage.getBody().begin()),
+         signedMessage.getBody().size() / 8});
+    auto proposalBody = proposalBodyReader.getRoot<proto::ProposalBody>();
+    for (const auto &req : proposalBody.getRequests()) {
+      responseToClient(req, newAcceptedProposal.proposalHash);
+    }
+    proposalsIt++;
+    acksIt++;
+  }
+  while (proposalsIt != proposalsEnd) {
+    auto &newPendingProposal = pendingChain.emplace_back();
+    newPendingProposal.proposal.assign(proposalsIt->begin(),
+                                       proposalsIt->end());
+    SHA256(newPendingProposal.proposal.data(),
+           newPendingProposal.proposal.size(), newPendingProposal.proposalHash);
+    capnp::FlatArrayMessageReader signedMessageReader(
+        {reinterpret_cast<const capnp::word *>(proposalsIt->begin()),
+         proposalsIt->size() / 8});
+    auto signedMessage = signedMessageReader.getRoot<proto::SignedMessage>();
+    capnp::FlatArrayMessageReader proposalBodyReader(
+        {reinterpret_cast<const capnp::word *>(signedMessage.getBody().begin()),
+         signedMessage.getBody().size() / 8});
+    auto proposalBody = proposalBodyReader.getRoot<proto::ProposalBody>();
+    for (const auto &req : proposalBody.getRequests()) {
+      responseToClient(req, newPendingProposal.proposalHash);
+    }
+    auto cancelers = getProposalCancelers(newPendingProposal.proposalHash);
+    if (!cancelers.contains(idx)) {
+      uint8_t compressedSig[64];
+      signData(newPendingProposal.proposalHash, compressedSig);
+      capnp::MallocMessageBuilder ackBuilder;
+      auto ack = ackBuilder.initRoot<proto::Acknowledgement>();
+      ack.setProposalHash({newPendingProposal.proposalHash, 32});
+      ack.getSign().setSign({compressedSig, 64});
+      ack.getSign().setIdx(idx);
+      sendToNode(signedMessage.getSign().getIdx(), MessageType::PROPOSAL_ACK,
+                 ackBuilder);
+      for (const auto &nodeIdx : cancelers) {
+        sendToNode(nodeIdx, MessageType::PROPOSAL_ACK, ackBuilder);
+      }
+    }
+    proposalsIt++;
+  }
+}
+
+void ZyzaReplica::sendFallbackAlert(uint16_t nodeIdx) {
+  capnp::MallocMessageBuilder fallbackAlertBodyBuilder;
+  auto fallbackAlertBody =
+      fallbackAlertBodyBuilder.initRoot<proto::FallbackAlertBody>();
+  fallbackAlertBody.setLastAckedProposalHash(
+      {acceptedChain.back().proposalHash, 32});
+  auto unackedProposals =
+      fallbackAlertBody.initUnackedSignedProposals(pendingChain.size());
+  int totalRequests = 0;
+  int i = 0;
+  for (const auto &pendingProposal : pendingChain) {
+    unackedProposals.set(
+        i, {pendingProposal.proposal.data(), pendingProposal.proposal.size()});
+    i++;
+    capnp::FlatArrayMessageReader proposalSignedMessageReader(
+        {reinterpret_cast<const capnp::word *>(pendingProposal.proposal.data()),
+         pendingProposal.proposal.size() / sizeof(capnp::word)});
+    auto proposalSignedMessage =
+        proposalSignedMessageReader.getRoot<proto::SignedMessage>();
+    capnp::FlatArrayMessageReader bodyMessage(
+        {reinterpret_cast<const capnp::word *>(
+             proposalSignedMessage.getBody().begin()),
+         proposalSignedMessage.getBody().size() / 8});
+    auto body = bodyMessage.getRoot<proto::ProposalBody>();
+    totalRequests += body.getRequests().size();
+  }
+  auto cancelSigns =
+      fallbackAlertBody.initUnackedSignedProposals(totalRequests);
+  i = 0;
+  for (const auto &pendingProposal : pendingChain) {
+    capnp::FlatArrayMessageReader proposalSignedMessageReader(
+        {reinterpret_cast<const capnp::word *>(pendingProposal.proposal.data()),
+         pendingProposal.proposal.size() / sizeof(capnp::word)});
+    auto proposalSignedMessage =
+        proposalSignedMessageReader.getRoot<proto::SignedMessage>();
+    capnp::FlatArrayMessageReader bodyMessage(
+        {reinterpret_cast<const capnp::word *>(
+             proposalSignedMessage.getBody().begin()),
+         proposalSignedMessage.getBody().size() / 8});
+    auto body = bodyMessage.getRoot<proto::ProposalBody>();
+    for (const auto &req : body.getRequests()) {
+      uint8_t cancelProof[8 + 32];
+      *reinterpret_cast<uint64_t *>(cancelProof) = req.getId();
+      memcpy(cancelProof + 8, pendingProposal.proposalHash, 32);
+      uint8_t cancelHash[32];
+      SHA256(cancelProof, 8 + 32, cancelHash);
+      uint8_t cancelSign[64];
+      signData(cancelHash, cancelSign);
+      cancelSigns.set(i, {cancelSign, 64});
+      i++;
+    }
+  }
+  capnp::MallocMessageBuilder signedMessage;
+  createSignedMessage(fallbackAlertBodyBuilder, signedMessage);
+  sendToNode(nodeIdx, MessageType::FALLBACK_ALERT, signedMessage);
+}
+
+void ZyzaReplica::handleTimeout() {
   std::clog << idx << ": switching to fallback" << std::endl;
   uint16_t backupLeader = (currentFastPathLeader + 1) % nodesCount;
 
   if (backupLeader == idx) {
     currentBackupPathLeader = idx;
-    transitionToLeaderFallback();
+    transitionToLeaderFallbackPath();
   } else {
     currentBackupPathLeader = currentFastPathLeader;
     transitionToNextBackupLeader();
@@ -869,20 +1199,6 @@ void ZyzaReplica::sendPendingNodeMessages(int i) {
   }
 }
 
-std::vector<uint16_t>
-ZyzaReplica::getProposalKeepers(std::span<uint8_t, 32> hash) {
-  std::vector<uint16_t> keepers(keepersPerProposal);
-  uint8_t h[2][32];
-  memcpy(h[0], hash.data(), 32);
-  for (int i = 0; i < keepersPerProposal; ++i) {
-    uint8_t *src = h[i % 2];
-    uint8_t *dst = h[(i + 1) % 2];
-    SHA256(src, 32, dst);
-    keepers[i] = ((dst[1] << 8) | dst[0]) % nodesCount;
-  }
-  return std::move(keepers);
-}
-
 void ZyzaReplica::createSignedMessage(capnp::MallocMessageBuilder &body,
                                       capnp::MallocMessageBuilder &message) {
   auto serializedBody = capnp::messageToFlatArray(body);
@@ -893,6 +1209,85 @@ void ZyzaReplica::createSignedMessage(capnp::MallocMessageBuilder &body,
   auto sign = signBuilder.initSign(64);
   signData(serializedBody.asBytes().begin(), serializedBody.asBytes().size(),
            sign.begin());
+}
+
+bool ZyzaReplica::validateAckList(
+    const uint8_t *proposalHash,
+    const capnp::List<proto::Signature>::Reader ackList) {
+
+  if (ackList.size() != quorumSize) {
+    std::clog << "wrong ack list size" << std::endl;
+    return false;
+  }
+  std::map<uint16_t, uint8_t[64]> signatures;
+  for (const auto &sign : ackList) {
+    if (sign.getSign().size() != 64) {
+      std::clog << "wrong ack signature size" << std::endl;
+      return false;
+    }
+    if (!verifyData(proposalHash, sign.getSign().begin(), sign.getIdx())) {
+      std::clog << "wrong signature" << std::endl;
+      return false;
+    }
+    memcpy(signatures[sign.getIdx()], sign.getSign().begin(), 64);
+  }
+  if (signatures.size() != quorumSize) {
+    std::clog << "duplicated acks in ack list" << std::endl;
+    return false;
+  }
+  for (const auto &canceler : getProposalCancelers(proposalHash)) {
+    if (!signatures.contains(canceler)) {
+      std::clog << "ack list does not contain ack from canceler" << std::endl;
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ZyzaReplica::validateResendChainResponse(
+    const proto::ResendChainResponse::Reader &nsr) {
+  if (nsr.getProposals().size() <= nsr.getAcknowledgements().size() ||
+      nsr.getProposals().size() >
+          nsr.getAcknowledgements().size() + maxPendingChainLength) {
+    std::clog << "wrong size of chain" << std::endl;
+    return false;
+  }
+  auto proposalsIt = nsr.getProposals().begin();
+  auto proposalsEnd = nsr.getProposals().end();
+  auto acksIt = nsr.getAcknowledgements().begin();
+  auto acksEnd = nsr.getAcknowledgements().end();
+  int lastSigner;
+  {
+    capnp::FlatArrayMessageReader reader(
+        {reinterpret_cast<const capnp::word *>(
+             acceptedChain.back().proposal.data()),
+         acceptedChain.back().proposal.size() / 8});
+    lastSigner = reader.getRoot<proto::SignedMessage>().getSign().getIdx();
+  }
+  uint8_t prevProposalHash[32];
+  memcpy(prevProposalHash, acceptedChain.back().proposalHash, 32);
+  while (proposalsIt != proposalsEnd) {
+    capnp::FlatArrayMessageReader reader(
+        {reinterpret_cast<const capnp::word *>(proposalsIt->begin()),
+         proposalsIt->size() / 8});
+    auto signedMessage = reader.getRoot<proto::SignedMessage>();
+    int expectedLeader = acksIt == acksEnd ? lastSigner : -1;
+    int expectedIndex =
+        acceptedChain.size() + (proposalsIt - nsr.getProposals().begin());
+    if (!validateProposal(signedMessage, acceptedChain.back().proposalHash,
+                          expectedLeader, expectedIndex)) {
+      return false;
+    }
+    SHA256(signedMessage.getBody().begin(), signedMessage.getBody().size(),
+           prevProposalHash);
+    if (acksIt != acksEnd && !validateAckList(prevProposalHash, *acksIt)) {
+      return false;
+    }
+    lastSigner = reader.getRoot<proto::SignedMessage>().getSign().getIdx();
+    proposalsIt++;
+    acksIt++;
+  }
+  return true;
 }
 
 void ZyzaReplica::signData(const uint8_t *data, size_t size, uint8_t *result) {

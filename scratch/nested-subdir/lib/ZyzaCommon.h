@@ -7,6 +7,8 @@
 
 #include <list>
 #include <optional>
+#include <set>
+#include <span>
 #include <vector>
 
 namespace zyza {
@@ -17,26 +19,27 @@ public:
   static void hexdump(const void *arr, size_t size);
 
 protected:
-  ZyzaCommon(int nodesCount,
+  ZyzaCommon(int nodesCount, int cancelersPerProposal,
              std::vector<std::vector<uint8_t>> &serializedPublicKeys);
 
-  bool validateProposal(
-      const proto::Proposal::Reader &proposal,
-      const uint8_t *expectedPrevProposalHash, int expectedProposalSigner,
-      bool checkQuorumSize, int proposalIndex, bool mustContainAcks,
-      std::optional<std::reference_wrapper<
-          std::list<std::pair<uint8_t[32], capnp::MallocMessageBuilder>>>>
-          pendingChain);
+  bool validateProposal(const proto::SignedMessage::Reader &proposal,
+                        const uint8_t *expectedPrevProposalHash,
+                        int expectedProposalSigner, int proposalIndex);
+
   int nodesCount;
   int quorumSize;
+  int cancelersPerProposal;
   secp256k1_context *secpCtx;
   std::vector<secp256k1_pubkey> publicKeys;
 
-  bool validateData(const capnp::Data::Reader &data,
-                    const proto::Signature::Reader &signature);
+  bool verifyData(const capnp::Data::Reader &data,
+                  const proto::Signature::Reader &signature);
 
-  bool validateData(std::span<const uint8_t, 32> hash,
-                    std::span<const uint8_t, 64> sign, int signer);
+  bool verifySignedMessage(const proto::SignedMessage::Reader &signedMessage);
+
+  bool verifyData(const uint8_t *hash, const uint8_t *sign, int signer);
+
+  std::set<uint16_t> getProposalCancelers(const uint8_t *proposalHash);
 };
 
 } // namespace zyza

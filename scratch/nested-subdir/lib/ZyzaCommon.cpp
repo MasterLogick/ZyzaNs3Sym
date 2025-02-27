@@ -10,10 +10,10 @@
 
 namespace zyza {
 
-ZyzaCommon::ZyzaCommon(int nodesCount,
+ZyzaCommon::ZyzaCommon(int nodesCount, int cancelersPerProposal,
                        std::vector<std::vector<uint8_t>> &serializedPublicKeys)
     : nodesCount(nodesCount), quorumSize(nodesCount - nodesCount / 3),
-      publicKeys(nodesCount) {
+      cancelersPerProposal(cancelersPerProposal), publicKeys(nodesCount) {
   secpCtx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
   uint8_t seed[32];
   ssize_t res = getrandom(seed, 32, 0);
@@ -27,13 +27,10 @@ ZyzaCommon::ZyzaCommon(int nodesCount,
   }
 }
 
-bool ZyzaCommon::validateProposal(
-    const proto::Proposal::Reader &proposal,
-    const uint8_t *expectedPrevProposalHash, int expectedProposalSigner,
-    bool checkQuorumSize, int proposalIndex, bool mustContainAcks,
-    std::optional<std::reference_wrapper<
-        std::list<std::pair<uint8_t[32], capnp::MallocMessageBuilder>>>>
-        pendingChain) {
+bool ZyzaCommon::validateProposal(const proto::SignedMessage::Reader &proposal,
+                                  const uint8_t *expectedPrevProposalHash,
+                                  int expectedProposalSigner,
+                                  int proposalIndex) {
   capnp::FlatArrayMessageReader bodyMessage(
       {reinterpret_cast<const capnp::word *>(proposal.getBody().begin()),
        proposal.getBody().size() / 8});
@@ -131,6 +128,19 @@ bool ZyzaCommon::validateProposal(
     }
   }
   return true;
+}
+
+std::vector<uint16_t> ZyzaCommon::getProposalCancelers(const uint8_t *proposalHash) {
+  std::vector<uint16_t> keepers(cancelersPerProposal);
+  uint8_t h[2][32];
+  memcpy(h[0], proposalHash, 32);
+  for (int i = 0; i < cancelersPerProposal; ++i) {
+    uint8_t *src = h[i % 2];
+    uint8_t *dst = h[(i + 1) % 2];
+    SHA256(src, 32, dst);
+    keepers[i] = ((dst[1] << 8) | dst[0]) % nodesCount;
+  }
+  return std::move(keepers);
 }
 
 void ZyzaCommon::hexdump(const uint8_t *arr, const char *note) {

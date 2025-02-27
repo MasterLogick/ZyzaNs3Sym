@@ -15,22 +15,25 @@ enum class MessageType {
   REQUEST = 1,
   REDIRECT_REQUEST = 2,
   RESPONSE = 3,
+  CLIENT_RESPONSE = 4,
+  REQUEST_CANCEL = 5,
 
   // node-leader fast path communication
-  NEW_PROPOSAL = 4,
-  PROPOSAL_ACK = 5,
-  PROPOSAL_KEEP_REQUEST = 6,
+  PROPOSAL = 6,
+  PROPOSAL_ACK = 7,
 
   // node-node fallback path communication
-  FALLBACK_ALERT = 7,
-  PROPOSAL_STATUS_REQUEST = 8,
-  PROPOSAL_STATUS_RESPONSE = 9,
+  FALLBACK_ALERT = 9,
   RECOVERY = 10,
   RECOVERY_ACK = 11,
 
+  // proposal cancel on clients
+  PROPOSAL_CANCEL_REQUEST = 12,
+  PROPOSAL_CANCEL_RESPONSE = 13,
+
   // node history recovery
-  RESEND_CHAIN_REQUEST = 12,
-  RESEND_CHAIN_RESPONSE = 13,
+  RESEND_CHAIN_REQUEST = 14,
+  RESEND_CHAIN_RESPONSE = 15,
 };
 
 constexpr const char *messageTypeToString(MessageType type) {
@@ -41,27 +44,30 @@ constexpr const char *messageTypeToString(MessageType type) {
     return "REDIRECT_REQUEST";
   case MessageType::RESPONSE:
     return "RESPONSE";
+  case MessageType::CLIENT_RESPONSE:
+    return "CLIENT_RESPONSE";
+  case MessageType::REQUEST_CANCEL:
+    return "REQUEST_CANCEL";
 
-  case MessageType::NEW_PROPOSAL:
-    return "NEXT_ROUND_PROPOSAL";
+  case MessageType::PROPOSAL:
+    return "PROPOSAL";
   case MessageType::PROPOSAL_ACK:
-    return "ROUND_ACK";
-  case MessageType::PROPOSAL_KEEP_REQUEST:
-    return "PROPOSAL_KEEP_REQUEST";
+    return "PROPOSAL_ACK";
 
   case MessageType::FALLBACK_ALERT:
     return "FALLBACK_ALERT";
-  case MessageType::PROPOSAL_STATUS_REQUEST:
-    return "PROPOSAL_STATUS_REQUEST";
-  case MessageType::PROPOSAL_STATUS_RESPONSE:
-    return "PROPOSAL_STATUS_RESPONSE";
   case MessageType::RECOVERY:
     return "RECOVERY";
   case MessageType::RECOVERY_ACK:
     return "RECOVERY_ACK";
 
+  case MessageType::PROPOSAL_CANCEL_REQUEST:
+    return "PROPOSAL_CANCEL_REQUEST";
+  case MessageType::PROPOSAL_CANCEL_RESPONSE:
+    return "PROPOSAL_CANCEL_RESPONSE";
+
   case MessageType::RESEND_CHAIN_REQUEST:
-    return "RESEND_CHAIN";
+    return "RESEND_CHAIN_REQUEST";
   case MessageType::RESEND_CHAIN_RESPONSE:
     return "RESEND_CHAIN_RESPONSE";
 

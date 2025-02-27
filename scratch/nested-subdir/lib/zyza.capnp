@@ -30,48 +30,54 @@ struct ResponseBody {
     proposalHash @2 :Data;
 }
 
+struct ClientResponse {
+    id @0 :UInt64;
+    proposalHash @1 :Data;
+    union {
+        completed @2 :List(Signature);
+        canceled @3 :Bool;
+    }
+}
+
+struct RequestCancelBody {
+    id @0 :UInt64;
+    proposalHash @1 :Data;
+    alertListHash @2 :Data;
+}
+
 struct ProposalBody {
     prevProposalHash @0 :Data;
+    requests @1 :List(Request);
+    ord @2 :UInt32;
+}
+
+struct Proposal {
+    signedProposal @0 :Data;
     acknowledgements @1 :List(List(Signature));
-    requests @2 :List(Request);
-    ord @3 :UInt32;
 }
 
 struct Acknowledgement {
-    hash @0 :Data;
+    proposalHash @0 :Data;
     sign @1 :Signature;
 }
 
 struct FallbackAlertBody {
-    unackedProposals @0 :List(Data);
+    lastAckedProposalHash @0 :Data;
+    unackedSignedProposals @1 :List(Data);
 }
 
-struct ProposalStatusRequest {
-    proposalHash @0 :Data;
-    idx @1 :UInt16;
-}
-
-struct ProposalStatusResponseBody {
-    proposalHash @0 :Data;
-    union {
-        acks @1 :List(Signature);
-        notEnoughAcks @2 :UInt8;
-    }
-}
-
-struct Recovery {
+struct AlertList {
     alerts @0 :List(SignedMessage);
-    union {
-        enoughAcks @1 :EnoughAcksRecovery;
-        notEnoughAcks @2 :NotEnoughAcksRecovery;
-    }
-    struct EnoughAcksRecovery {
-        ackedPart @0 :List(List(SignedMessage));
-        unackedPart @1 :List(List(SignedMessage));
-    }
-    struct NotEnoughAcksRecovery {
-        psrs @0 :List(List(SignedMessage));
-    }
+}
+
+struct ProposalCancelResponseBody {
+    proposalHash @0 :Data;
+    clientResponses @1 :List(ClientResponse);
+}
+
+struct RecoveryBody {
+    alerts @0 :AlertList;
+    proposalCancelResponses @1 :List(List(SignedMessage));
 }
 
 struct RecoveryAck {
@@ -81,9 +87,10 @@ struct RecoveryAck {
 
 struct ResendChainRequest {
     idx @0 :UInt16;
-    lastAckedProposal @1 :Data;
+    lastAckedProposalHash @1 :Data;
 }
 
 struct ResendChainResponse {
-    chainPart @0 :List(SignedMessage);
+    proposals @0 :List(Data);
+    acknowledgements @1 :List(List(Signature));
 }
