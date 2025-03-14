@@ -12,8 +12,6 @@
 #include <iostream>
 #include <map>
 #include <openssl/sha.h>
-#include <sys/random.h>
-#include <uvw.hpp>
 #include <uvw/tcp.h>
 
 namespace zyza {
@@ -29,10 +27,7 @@ ZyzaClientRequest::ZyzaClientRequest(
   p2psh.GetSpokeIpv4Address(nodesCount + clientId).Serialize(addr);
   host = std::to_string(addr[0]) + "." + std::to_string(addr[1]) + "." +
          std::to_string(addr[2]) + "." + std::to_string(addr[3]);
-  ssize_t rc = getrandom(&reqId, 8, 0);
-  assert(rc == 8);
-  rc = getrandom(dropSecret, 32, 0);
-  assert(rc == 32);
+  fillRandom(&reqId, sizeof(reqId));
   if (leaderHint < nodesCount) {
     currentLeader = leaderHint;
   } else {
@@ -41,34 +36,30 @@ ZyzaClientRequest::ZyzaClientRequest(
 }
 
 void ZyzaClientRequest::onListeningStart() {
-  requestTimeoutTimerEvent = ns3::Simulator::Schedule(
-      ns3::Time::From(requestTimeout.count(), ns3::Time::MS), [this] {
-        auto rc = getrandom(&currentLeader, sizeof(currentLeader), 0);
-        assert(rc == 2);
-        currentLeader %= nodesCount;
-        sendRequestToNode(currentLeader);
-      });
   if (currentLeader == 0xffff) {
-    auto rc = getrandom(&currentLeader, sizeof(currentLeader), 0);
-    assert(rc == 2);
+    fillRandom(&currentLeader, sizeof(currentLeader));
     currentLeader %= nodesCount;
   }
-  sendRequestToNode(currentLeader);
+  sendRequestToNode();
 }
 
-void ZyzaClientRequest::sendRequestToNode(uint16_t i) {
-  auto requestBuilder = std::make_shared<capnp::MallocMessageBuilder>();
-  auto request = requestBuilder->initRoot<proto::Request>();
+void ZyzaClientRequest::sendRequestToNode() {
+  capnp::MallocMessageBuilder requestBuilder;
+  auto request = requestBuilder.initRoot<proto::Request>();
+  request.setImpl({req.data(), req.size()});
   request.setId(reqId);
   request.setRespAddr(host);
   request.setRespPort(1235);
-  request.setImpl({req.data(), req.size()});
-  uint8_t dropHash[32];
-  SHA256(dropSecret, 32, dropHash);
-  request.setDropHash({dropHash, 32});
   std::clog << ns3::Simulator::Now().As() << ": " << clientId
-            << ": sending request to " << i << std::endl;
-  sendToNode(i, MessageType::REQUEST, requestBuilder);
+            << "c: sending request to " << currentLeader << std::endl;
+  sendToNode(currentLeader, MessageType::REQUEST, requestBuilder);
+  requestTimeoutTimerEvent.Cancel();
+  requestTimeoutTimerEvent = ns3::Simulator::Schedule(
+      ns3::Time::From(requestTimeout.count(), ns3::Time::MS), [this] {
+        fillRandom(&currentLeader, sizeof(currentLeader));
+        currentLeader %= nodesCount;
+        sendRequestToNode();
+      });
 }
 
 void ZyzaClientRequest::onTcpMessage(std::span<const uint8_t> message) {
@@ -78,7 +69,7 @@ void ZyzaClientRequest::onTcpMessage(std::span<const uint8_t> message) {
 void ZyzaClientRequest::onUdpMessage(std::span<const uint8_t> message) {
   auto *header = reinterpret_cast<const MessageHeader *>(message.data());
   std::clog << ns3::Simulator::Now().As() << ": " << clientId
-            << ": client got message: "
+            << "c: client got message: "
             << messageTypeToString(
                    static_cast<MessageType>(header->messageType))
             << " from " << header->senderIdx << ": " << std::hex
@@ -94,37 +85,33 @@ void ZyzaClientRequest::onUdpMessage(std::span<const uint8_t> message) {
              MessageType::REDIRECT_REQUEST) {
     processRedirect(responseReader.getRoot<proto::Redirect>());
   } else if (static_cast<MessageType>(header->messageType) ==
-             MessageType::QUORUM_DROP_REQUEST) {
-    processQuorumDropRequest(responseReader.getRoot<proto::QuorumDropRequest>(),
-                             header->senderIdx);
+             MessageType::REQUEST_CANCEL) {
+    processRequestCancel(responseReader.getRoot<proto::SignedMessage>());
   }
 }
 
-void ZyzaClientRequest::run(
-    std::span<const uint8_t> request,
-    std::function<void(std::vector<uint8_t>)> responseCallback) {
-  this->responseCallback = responseCallback;
+void ZyzaClientRequest::run(std::span<const uint8_t> request,
+                            std::function<void(std::vector<uint8_t>)> rc) {
+  responseCallback = rc;
   req = request;
   Endpoint::run();
 }
 
-void ZyzaClientRequest::sendToNode(
-    int node, MessageType messageType,
-    std::shared_ptr<capnp::MessageBuilder> message) {
+void ZyzaClientRequest::sendToNode(int node, MessageType messageType,
+                                   capnp::MessageBuilder &message) {
   uint64_t msgId = 0;
-  auto rc = getrandom(&msgId, sizeof(msgId), 0);
-  assert(rc == sizeof(msgId));
+  fillRandom(&msgId, sizeof(msgId));
   uint32_t size =
-      capnp::computeSerializedSizeInWords(*message) * 8 + sizeof(MessageHeader);
+      capnp::computeSerializedSizeInWords(message) * 8 + sizeof(MessageHeader);
   auto data = std::make_unique<uint8_t[]>(size);
   new (data.get()) MessageHeader(size, static_cast<uint16_t>(0xffff),
                                  static_cast<uint16_t>(messageType), msgId);
   kj::ArrayOutputStream aos(
       {data.get() + sizeof(MessageHeader), size - sizeof(MessageHeader)});
-  capnp::writeMessage(aos, *message);
+  capnp::writeMessage(aos, message);
   ns3::Address address(
       ns3::InetSocketAddress(p2psh.GetSpokeIpv4Address(node), 1235));
-  std::clog << ns3::Simulator::Now().As() << ": " << clientId << ": sending "
+  std::clog << ns3::Simulator::Now().As() << ": " << clientId << "c: sending "
             << messageTypeToString(static_cast<MessageType>(messageType))
             << " to " << node << ": " << std::hex << msgId << std::dec
             << std::endl;
@@ -133,136 +120,130 @@ void ZyzaClientRequest::sendToNode(
 
 void ZyzaClientRequest::processResponse(
     const proto::Response::Reader &response) {
-  capnp::FlatArrayMessageReader responseBodyBuilder(
-      {reinterpret_cast<const capnp::word *>(response.getBody().begin()),
-       response.getBody().size() / 8});
-  auto responseBody = responseBodyBuilder.getRoot<proto::ResponseBody>();
-  if (responseBody.getId() != reqId) {
+  if (pendingQc.contains(response.getProof().getSign().getIdx())) {
+    std::clog << "duplicate response" << std::endl;
+    return;
+  }
+  if (!verifySignedMessage(response.getProof())) {
+    return;
+  }
+  capnp::FlatArrayMessageReader responseProofReader(
+      {reinterpret_cast<const capnp::word *>(
+           response.getProof().getBody().begin()),
+       response.getProof().getBody().size() / 8});
+  auto responseProofBody =
+      responseProofReader.getRoot<proto::ResponseProofBody>();
+  if (responseProofBody.getId() != reqId) {
     std::clog << "wrong request id" << std::endl;
     return;
   }
-  if (response.getSign().getSign().size() != 64) {
-    std::clog << "wrong response sign size" << std::endl;
+  if (responseProofBody.getProposalHash().size() != 32) {
+    std::clog << "wrong proposal hash size" << std::endl;
     return;
   }
-  if (responseBody.getProposalHash().size() != 32) {
-    std::clog << "wrong proposal hash size: "
-              << responseBody.getProposalHash().size() << std::endl;
+  if (responseProofBody.getImplHash().size() != 32) {
+    std::clog << "wrong impl hash size" << std::endl;
     return;
   }
-  capnp::MallocMessageBuilder b;
-  auto respBodyClone = b.initRoot<proto::ResponseBody>();
-  b.setRoot(responseBody);
-  auto data = capnp::messageToFlatArray(b);
   uint8_t hash[32];
-  SHA256(response.getBody().begin(), response.getBody().size(), hash);
-  hexdump(hash, "response body hash");
-  secp256k1_ecdsa_signature sig;
-  int rc = secp256k1_ecdsa_signature_parse_compact(
-      secpCtx, &sig, response.getSign().getSign().begin());
-  if (rc != 1) {
-    std::clog << "wrong response packed sign" << std::endl;
+  SHA256(response.getImpl().begin(), response.getImpl().size(), hash);
+  if (memcmp(hash, responseProofBody.getImplHash().begin(), 32) != 0) {
+    std::clog << "wrong impl hash" << std::endl;
     return;
   }
-  rc = secp256k1_ecdsa_verify(secpCtx, &sig, hash,
-                              &publicKeys[response.getSign().getIdx()]);
-  if (rc != 1) {
-    std::clog << "wrong response sign" << std::endl;
-    return;
-  }
-  memcpy(pendingQc[response.getSign().getIdx()].first,
-         response.getSign().getSign().begin(), 64);
-  memcpy(pendingQc[response.getSign().getIdx()].second, hash, 32);
+  uint8_t proofHash[32];
+  SHA256(response.getProof().getBody().begin(),
+         response.getProof().getBody().size(), proofHash);
+  auto &resp = pendingQc[response.getProof().getSign().getIdx()];
+  memcpy(resp.proofHash, proofHash, 32);
+  memcpy(resp.sign, response.getProof().getSign().getSign().begin(), 64);
   int c = 0;
-  for (const auto &item : pendingQc) {
-    if (memcmp(item.second.second, hash, 32) == 0) {
+  for (const auto &[nodeId, r] : pendingQc) {
+    if (memcmp(r.proofHash, proofHash, 32) == 0) {
       c++;
     }
   }
   if (c == quorumSize) {
-    auto qcBuilder = std::make_shared<capnp::MallocMessageBuilder>();
-    auto qc = qcBuilder->initRoot<proto::QuorumCertificate>();
-    qc.setResponse(responseBody);
-    auto signs = qc.initSigns(quorumSize);
+    capnp::MallocMessageBuilder clientResponseBuilder;
+    auto clientResponse =
+        clientResponseBuilder.initRoot<proto::ClientResponse>();
+    clientResponse.setId(reqId);
+    auto completed = clientResponse.initCompleted();
+    completed.setProofBody(response.getProof().getBody());
+    auto proof = completed.initProof(quorumSize);
     int i = 0;
-    for (const auto &item : pendingQc) {
-      if (memcmp(item.second.second, hash, 32) == 0) {
-        signs[i].setIdx(item.first);
-        signs[i].setSign({item.second.first, 64});
+    for (const auto &[nodeId, r] : pendingQc) {
+      if (memcmp(r.proofHash, proofHash, 32) == 0) {
+        proof[i].setIdx(nodeId);
+        proof[i].setSign({r.sign, 64});
         i++;
       }
     }
-    //        loop->walk([](auto& handle) { handle.close(); });
 
-    requestTimeoutTimerEvent.Cancel();
     for (int j = 0; j < nodesCount; ++j) {
-      sendToNode(j, MessageType::ACCEPT_QUORUM_CERTIFICATE, qcBuilder);
+      sendToNode(j, MessageType::CLIENT_RESPONSE, clientResponseBuilder);
     }
-    resp.assign(responseBody.getImpl().begin(), responseBody.getImpl().end());
-    responseCallback(resp);
+    std::vector<uint8_t> r(response.getImpl().begin(),
+                           response.getImpl().end());
+    requestTimeoutTimerEvent.Cancel();
+    pendingQc.clear();
+    cancelRequests.clear();
+    responseCallback(std::move(r));
   }
 }
 
 void ZyzaClientRequest::processRedirect(
     const proto::Redirect::Reader &redirect) {
-  currentLeader = redirect.getRedirect() % nodesCount;
-  std::clog << clientId << ": redirecting request to " << currentLeader
-            << std::endl;
-  sendRequestToNode(currentLeader);
-}
-
-void ZyzaClientRequest::processQuorumDropRequest(
-    const proto::QuorumDropRequest::Reader &qdr, int sender) {
-  if (qdr.getReqId() != reqId) {
-    std::clog << "wrong req id" << std::endl;
-  }
-  auto proof = qdr.getProof();
-  if (qdr.getProof().size() != quorumSize) {
-    std::clog << "wrong proof size" << std::endl;
+  if (redirect.getRedirect() >= nodesCount) {
+    std::clog << "wrong redirect node idx" << std::endl;
     return;
   }
-  uint8_t expectedPrevProposalHash[32];
-  uint16_t expectedPrevProposalSigner = 0;
-  {
-    capnp::FlatArrayMessageReader proposalReader(
-        {reinterpret_cast<const capnp::word *>(
-             proof[0].getUnackedProposal().begin()),
-         proof[0].getUnackedProposal().size() / 8});
-    auto proposal = proposalReader.getRoot<proto::Proposal>();
-    capnp::FlatArrayMessageReader proposalBodyReader(
-        {reinterpret_cast<const capnp::word *>(proposal.getBody().begin()),
-         proposal.getBody().size() / 8});
-    auto proposalBody = proposalBodyReader.getRoot<proto::ProposalBody>();
-    if (proposalBody.getPrevProposalHash().size() != 32) {
-      std::clog << "wrong proposal's prev proposal hash size: "
-                << proposalBody.getPrevProposalHash().size() << std::endl;
-      return;
-    }
-    memcpy(expectedPrevProposalHash, proposalBody.getPrevProposalHash().begin(),
-           32);
-    expectedPrevProposalSigner = proposal.getSign().getIdx();
-  }
-  hexdump(expectedPrevProposalHash, "expected prev proposal hash");
-  std::clog << "expected proposal leader: " << expectedPrevProposalSigner
+  currentLeader = redirect.getRedirect();
+  std::clog << clientId << "c: resending request to " << currentLeader
             << std::endl;
-  for (const auto &item : proof) {
-    capnp::FlatArrayMessageReader unackedProposalReader(
-        {reinterpret_cast<const capnp::word *>(
-             item.getUnackedProposal().begin()),
-         item.getUnackedProposal().size() / 8});
-    auto unackedProposal = unackedProposalReader.getRoot<proto::Proposal>();
-    if (!validateProposal(unackedProposal, expectedPrevProposalHash,
-                          expectedPrevProposalSigner, true, -1)) {
-      std::clog << "failed to verify drop proof" << std::endl;
-      return;
-    }
+  sendRequestToNode();
+}
+void ZyzaClientRequest::processRequestCancel(
+    const proto::SignedMessage::Reader &signedMessage) {
+  if (!verifySignedMessage(signedMessage)) {
+    return;
   }
-  std::shared_ptr<capnp::MallocMessageBuilder> responseBuilder(
-      new capnp::MallocMessageBuilder());
-  auto response = responseBuilder->initRoot<proto::QuorumDropResponse>();
-  response.setReqId(reqId);
-  response.setDropSecret({dropSecret, 32});
-  sendToNode(sender, MessageType::QUORUM_DROP_RESPONSE, responseBuilder);
-  std::clog << "sent drop responses" << std::endl;
+  capnp::FlatArrayMessageReader requestCancelBodyReader(
+      {reinterpret_cast<const capnp::word *>(signedMessage.getBody().begin()),
+       signedMessage.getBody().size() / 8});
+  auto requestCancelBody =
+      requestCancelBodyReader.getRoot<proto::RequestCancelBody>();
+  if (requestCancelBody.getId() != reqId) {
+    std::clog << "wrong request cancel request id" << std::endl;
+    return;
+  }
+  memcpy(cancelRequests[requestCancelBody.getBackupLeader()]
+                       [signedMessage.getSign().getIdx()],
+         signedMessage.getSign().getSign().begin(), 64);
+  if (cancelRequests[requestCancelBody.getBackupLeader()].size() ==
+      quorumSize) {
+    capnp::MallocMessageBuilder clientResponseBuilder;
+    auto clientResponse =
+        clientResponseBuilder.initRoot<proto::ClientResponse>();
+    clientResponse.setId(reqId);
+    auto canceled = clientResponse.initCanceled();
+    canceled.setBackupLeader(requestCancelBody.getBackupLeader());
+    auto proof = canceled.initProof(quorumSize);
+    int i = 0;
+    for (const auto &[nodeId, sign] :
+         cancelRequests[requestCancelBody.getBackupLeader()]) {
+      proof[i].setIdx(nodeId);
+      proof[i].setSign({sign, 64});
+      i++;
+    }
+    for (int j = 0; j < nodesCount; ++j) {
+      sendToNode(j, MessageType::CLIENT_RESPONSE, clientResponseBuilder);
+    }
+    cancelRequests.clear();
+    pendingQc.clear();
+    fillRandom(&reqId, sizeof(reqId));
+    fillRandom(&currentLeader, sizeof(currentLeader));
+    sendRequestToNode();
+  }
 }
 } // namespace zyza

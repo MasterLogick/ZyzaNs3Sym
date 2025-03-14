@@ -18,19 +18,14 @@ public:
 
   static void hexdump(const void *arr, size_t size);
 
+  static void hexdump(const proto::SignedMessage::Reader &message,
+                      const char *note);
+
+  static void fillRandom(void *data, size_t size);
+
 protected:
-  ZyzaCommon(int nodesCount, int cancelersPerProposal,
+  ZyzaCommon(int nodesCount,
              std::vector<std::vector<uint8_t>> &serializedPublicKeys);
-
-  bool validateProposal(const proto::SignedMessage::Reader &proposal,
-                        const uint8_t *expectedPrevProposalHash,
-                        int expectedProposalSigner, int proposalIndex);
-
-  int nodesCount;
-  int quorumSize;
-  int cancelersPerProposal;
-  secp256k1_context *secpCtx;
-  std::vector<secp256k1_pubkey> publicKeys;
 
   bool verifyData(const capnp::Data::Reader &data,
                   const proto::Signature::Reader &signature);
@@ -39,7 +34,9 @@ protected:
 
   bool verifyData(const uint8_t *hash, const uint8_t *sign, int signer);
 
-  std::set<uint16_t> getProposalCancelers(const uint8_t *proposalHash);
+  int nodesCount;
+  int quorumSize;
+  std::vector<secp256k1_pubkey> publicKeys;
 };
 
 } // namespace zyza
