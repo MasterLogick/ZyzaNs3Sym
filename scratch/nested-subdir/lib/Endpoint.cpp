@@ -43,7 +43,7 @@ void Endpoint::run() {
               if (s == nullptr) {
                 return;
               }
-              if (inDestructor) {
+              if (!inDestructor) {
                 acceptedSockets.erase(a);
               }
             },
@@ -53,7 +53,7 @@ void Endpoint::run() {
               if (s == nullptr) {
                 return;
               }
-              if (inDestructor) {
+              if (!inDestructor) {
                 acceptedSockets.erase(a);
               }
             });
@@ -135,12 +135,19 @@ void Endpoint::run() {
   onListeningStart();
 }
 
-Endpoint::~Endpoint() {
+void Endpoint::stop() {
   inDestructor = true;
   for (const auto &item : acceptedSockets) {
     item->Close();
+    item->Dispose();
   }
+  acceptedSockets.clear();
   serverTcpSocket->Close();
+  serverTcpSocket->Dispose();
   serverUdpSocket->Close();
+  serverUdpSocket->Dispose();
+  inDestructor = false;
 }
+
+Endpoint::~Endpoint() { stop(); }
 } // namespace zyza

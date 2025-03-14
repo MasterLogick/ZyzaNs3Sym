@@ -3,11 +3,10 @@
 
 #include "../../src/point-to-point-layout/model/point-to-point-star.h"
 #include "Endpoint.h"
-#include "FallbackRequestState.h"
 #include "MessageHeader.h"
+#include "MessageType.h"
 #include "ZyzaCommon.h"
 #include "lib/zyza.capnp.h"
-
 #include "ns3/applications-module.h"
 #include "ns3/internet-module.h"
 #include "ns3/network-module.h"
@@ -25,16 +24,23 @@ class ZyzaReplica : public Endpoint,
                     public ZyzaCommon,
                     public ns3::Application {
 public:
-  ZyzaReplica(int nodesCount, int cancelersPerProposal, int idx,
-              ns3::PointToPointStarHelper &p2psh,
+  ZyzaReplica(int nodesCount, int idx, ns3::PointToPointStarHelper &p2psh,
               std::vector<std::vector<uint8_t>> &serializedPublicKeys,
               std::span<const uint8_t> privateKey,
-              std::chrono::milliseconds fallbackTimeout);
+              std::chrono::milliseconds alertTimeout,
+              std::chrono::milliseconds leaderSwitchTimeout,
+              int maxPendingChainLength);
 
   ~ZyzaReplica() noexcept override = default;
 
 private:
   void StartApplication() override;
+
+  void StopApplication() override;
+
+  void startupLeader();
+
+  void startupBackup();
 
 protected:
   virtual std::vector<uint8_t> processRequest(std::span<const uint8_t> request);
@@ -50,21 +56,19 @@ private:
 
   void processClientResponse(const proto::ClientResponse::Reader &reader);
 
+  void processClientResponses(const proto::SignedMessage::Reader &reader);
+
   void processProposal(const proto::Proposal::Reader &proposal);
 
-  void processAcknowledgement(const proto::Acknowledgement::Reader &ack);
+  void processAcknowledgement1(const proto::Acknowledgement::Reader &ack);
+
+  void processAcknowledgement2(const proto::Acknowledgement::Reader &ack);
 
   void processFallbackAlert(const proto::SignedMessage::Reader &fallbackAlert);
 
-  void processProposalCancelRequest(
-      const proto::SignedMessage::Reader &proposalCancelRequest);
-
-  void processProposalCancelResponse(
-      const proto::SignedMessage::Reader &proposalCancelResponse);
+  void processRecoveryState(const proto::SignedMessage::Reader &recoveryState);
 
   void processRecovery(const proto::SignedMessage::Reader &recovery);
-
-  void processRecoveryAck(const proto::RecoveryAck::Reader &recoveryAck);
 
   void processResendChainRequest(const proto::ResendChainRequest::Reader &nsr);
 
@@ -77,47 +81,49 @@ private:
 
   void transitionToBackupFastPath();
 
+  void transitionToLeaderFastPath();
+
+  void onEnoughFallbackAlertsCollected();
+
+  void onClientResponse();
+
   void onPendingBlockAcksReady();
 
   void onRequestAccepted();
 
   void startNewRound();
 
+  void recoverPendingChain(const proto::RecoveryBody::Reader &recoveryBody);
+
   void responseToClient(const proto::Request::Reader &request,
                         uint8_t *proposalHash);
 
   struct Proposal {
     uint8_t proposalHash[32];
-    std::map<uint16_t, uint8_t[64]> acks;
+    std::map<uint16_t, uint8_t[64]> acks1;
+    std::map<uint16_t, uint8_t[64]> acks2;
     std::vector<uint8_t> proposal;
     Proposal() = default;
     Proposal(Proposal &&m) = default;
   };
 
-  void resendChainPart(int nodeIdx,
+  void resendChainPart(int sender,
                        std::list<Proposal>::iterator acceptedChainIter,
                        int acceptedChainPartSize,
                        std::list<Proposal>::iterator pendingChainIter,
                        int pendingChainPartSize);
 
-  struct PendingProposalCancelRequest {
-    uint8_t proposalHash[32];
-    int clientCount;
-    std::map<uint64_t, std::unique_ptr<capnp::MallocMessageBuilder>>
-        clientResponses;
-    std::set<uint16_t> reporters;
-  };
-
-  void sendProposalCancelResponse(PendingProposalCancelRequest &pendingRequest,
-                                  uint16_t nodeIdx);
-
   void sendFallbackAlert(uint16_t nodeIdx);
+
+  void sendAck2(const Proposal &proposal);
 
   void appendTail(
       capnp::List<capnp::Data>::Reader::Iterator proposalsIt,
       capnp::List<capnp::Data>::Reader::Iterator proposalsEnd,
-      capnp::List<capnp::List<proto::Signature>>::Reader::Iterator acksIt,
-      capnp::List<capnp::List<proto::Signature>>::Reader::Iterator acksEnd);
+      capnp::List<proto::AckList>::Reader::Iterator acks1It,
+      capnp::List<proto::AckList>::Reader::Iterator acks1End,
+      capnp::List<capnp::List<proto::Signature>>::Reader::Iterator acks2It,
+      capnp::List<capnp::List<proto::Signature>>::Reader::Iterator acks2End);
 
   void handleTimeout();
 
@@ -134,11 +140,24 @@ private:
   void createSignedMessage(capnp::MallocMessageBuilder &body,
                            capnp::MallocMessageBuilder &message);
 
-  bool validateAckList(const uint8_t *proposalHash,
-                       const capnp::List<proto::Signature>::Reader ackList);
+  bool validateProposal(const proto::SignedMessage::Reader &proposal,
+                        const uint8_t *expectedPrevProposalHash,
+                        int expectedProposalSigner, int proposalIndex);
+
+  bool
+  validateSignatureList(const uint8_t *proposalHash,
+                        const capnp::List<proto::Signature>::Reader ackList);
 
   bool
   validateResendChainResponse(const proto::ResendChainResponse::Reader &nsr);
+
+  bool validateFallbackAlert(const proto::SignedMessage::Reader &fallbackAlert);
+
+  bool
+  validateClientResponse(const proto::ClientResponse::Reader &clientResponse);
+
+  bool validateClientResponses(
+      const proto::ClientResponsesBody::Reader &clientResponsesBody);
 
   void signData(const uint8_t *data, size_t size, uint8_t *result);
 
@@ -153,23 +172,28 @@ private:
 
   // backup node fast path variables
   uint16_t currentFastPathLeader;
-  std::list<Proposal> pendingChain;
   ns3::EventId backupFastPathTimeout;
 
   // backup node fallback path variables
   uint16_t currentBackupPathLeader;
-  std::unique_ptr<capnp::MallocMessageBuilder> recoveryMessageBuilder;
-  uint8_t recoveryMessageHash[32];
-  std::set<uint16_t> recoveryAcks;
+  bool sentClientResponses;
   ns3::EventId nextLeaderAlertTimerEvent;
 
   // leader node fallback path variables
-  std::map<uint16_t, capnp::MallocMessageBuilder> acceptedFallbackAlerts;
-  std::map<uint8_t[32], capnp::MallocMessageBuilder> proposalStatuses;
+  std::map<uint16_t, std::unique_ptr<capnp::MallocMessageBuilder>>
+      acceptedFallbackAlerts;
+  std::map<uint16_t, std::unique_ptr<capnp::MallocMessageBuilder>>
+      backupNodesClientResponses;
 
   // leader node fast path variables
   std::vector<std::unique_ptr<capnp::MallocMessageBuilder>> pendingRequests;
-  std::list<Proposal> pendingProposals;
+
+  // common fallback path variables
+  std::set<uint64_t> expectedClientResponses;
+  uint8_t recoveryStateBodyHash[32];
+  std::unique_ptr<capnp::MallocMessageBuilder> recoveryStateBuilder;
+  std::map<uint64_t, std::unique_ptr<capnp::MallocMessageBuilder>>
+      clientResponses;
 
   // common variables
   enum class ReplicaState {
@@ -178,13 +202,16 @@ private:
     LEADER_FAST = 3,
     LEADER_FALLBACK = 4
   } currentState;
-  int proposalOrd;
   std::map<uint16_t, std::vector<std::pair<std::unique_ptr<char[]>, uint32_t>>>
       pendingNodeMessages;
   bool initPassed;
   std::list<Proposal> acceptedChain;
-  std::list<PendingProposalCancelRequest> pendingProposalCancelRequests;
-  std::list<std::pair<uint8_t[32], std::set<uint16_t>>> keepedAcksInfo;
+  struct UnknownAckList {
+    uint8_t proposalHash[32];
+    std::map<uint16_t, uint8_t[64]> signatures;
+  };
+  std::list<UnknownAckList> unknownAcks;
+  std::list<Proposal> pendingChain;
 
   ns3::Time last;
   ns3::Time start;

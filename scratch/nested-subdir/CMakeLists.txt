@@ -49,7 +49,6 @@ add_library(zyza STATIC
         lib/MessageHeader.h
         lib/ZyzaCommon.cpp
         lib/ZyzaCommon.h
-        lib/FallbackRequestState.h
 )
 target_link_libraries(zyza PUBLIC CapnProto::capnp-rpc secp256k1 uvw::uvw-static uv::uv-static OpenSSL::Crypto)
 target_include_directories(zyza PUBLIC ${CMAKE_CURRENT_BINARY_DIR})

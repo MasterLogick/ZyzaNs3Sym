@@ -1,148 +1,16 @@
 #include "ZyzaCommon.h"
 
+#include <algorithm>
 #include <capnp/serialize.h>
 #include <cassert>
 #include <iostream>
 #include <list>
 #include <openssl/sha.h>
+#include <random>
 #include <sstream>
 #include <sys/random.h>
 
 namespace zyza {
-
-ZyzaCommon::ZyzaCommon(int nodesCount, int cancelersPerProposal,
-                       std::vector<std::vector<uint8_t>> &serializedPublicKeys)
-    : nodesCount(nodesCount), quorumSize(nodesCount - nodesCount / 3),
-      cancelersPerProposal(cancelersPerProposal), publicKeys(nodesCount) {
-  secpCtx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
-  uint8_t seed[32];
-  ssize_t res = getrandom(seed, 32, 0);
-  assert(res == 32);
-  assert(secp256k1_context_randomize(secpCtx, seed));
-  for (size_t i = 0; i < publicKeys.size(); i++) {
-    auto rc = secp256k1_ec_pubkey_parse(secpCtx, &publicKeys[i],
-                                        serializedPublicKeys[i].data(),
-                                        serializedPublicKeys[i].size());
-    assert(rc);
-  }
-}
-
-bool ZyzaCommon::validateProposal(const proto::SignedMessage::Reader &proposal,
-                                  const uint8_t *expectedPrevProposalHash,
-                                  int expectedProposalSigner,
-                                  int proposalIndex) {
-  capnp::FlatArrayMessageReader bodyMessage(
-      {reinterpret_cast<const capnp::word *>(proposal.getBody().begin()),
-       proposal.getBody().size() / 8});
-  auto body = bodyMessage.getRoot<proto::ProposalBody>();
-  if (proposalIndex != -1 && body.getOrd() != proposalIndex) {
-    std::clog << "wrong proposal index " << body.getOrd() << ", expected "
-              << proposalIndex << std::endl;
-    return false;
-  }
-  if (mustContainAcks && body.getAcknowledgements().size() == 0) {
-    std::clog << "provided proposal must contain acknowledgements" << std::endl;
-    return false;
-  }
-  if (body.getAcknowledgements().size() != quorumSize && checkQuorumSize) {
-    std::clog << "wrong proposal quorum size" << std::endl;
-    return false;
-  }
-  if (proposal.getSign().getSign().size() != 64) {
-    std::clog << "wrong proposal sign size" << std::endl;
-    return false;
-  }
-  if (expectedProposalSigner != -1) {
-    if (proposal.getSign().getIdx() != expectedProposalSigner) {
-      std::clog << "wrong proposal signer" << std::endl;
-      return false;
-    }
-  }
-  if (body.getPrevProposalHash().size() != 32) {
-    std::clog << "wrong proposal hash size" << std::endl;
-    return false;
-  }
-  if (expectedPrevProposalHash != nullptr) {
-    if (memcmp(expectedPrevProposalHash, body.getPrevProposalHash().begin(),
-               32) != 0) {
-      hexdump(body.getPrevProposalHash().begin(), "wrong proposal hash");
-      hexdump(expectedPrevProposalHash, "expected hash");
-      return false;
-    }
-  }
-  int rc = 0;
-  if (pendingChain.has_value()) {
-    if (pendingChain->get().size() > body.getAcknowledgements().size()) {
-      std::clog << "got acknowledgements for unknown blocks" << std::endl;
-      return false;
-    }
-    auto b = pendingChain->get().begin();
-    for (const auto &ack : body.getAcknowledgements()) {
-      if (ack.size() != quorumSize) {
-        std::clog << "wrong acknowledgement size" << std::endl;
-        return false;
-      }
-      for (const auto &item : ack) {
-        if (item.getSign().size() != 64) {
-          std::clog << "wrong proposal ack sign size" << std::endl;
-          return false;
-        }
-        if (item.getIdx() >= nodesCount) {
-          std::clog << "wrong proposal ack node id" << std::endl;
-          return false;
-        }
-        secp256k1_ecdsa_signature sig;
-        rc = secp256k1_ecdsa_signature_parse_compact(secpCtx, &sig,
-                                                     item.getSign().begin());
-        if (!rc) {
-          std::clog << "wrong proposal ack packed sign" << std::endl;
-          return false;
-        }
-        rc = secp256k1_ecdsa_verify(secpCtx, &sig, b->first,
-                                    &publicKeys[item.getIdx()]);
-        if (!rc) {
-          std::clog << "wrong proposal ack sign" << std::endl;
-          return false;
-        }
-      }
-      b++;
-    }
-  }
-  uint8_t receivedProposalHash[32];
-  SHA256(proposal.getBody().asBytes().begin(),
-         proposal.getBody().asBytes().size(), receivedProposalHash);
-  hexdump(receivedProposalHash, "received proposal body hash");
-  secp256k1_ecdsa_signature sig;
-  rc = secp256k1_ecdsa_signature_parse_compact(
-      secpCtx, &sig, proposal.getSign().getSign().begin());
-  if (!rc) {
-    std::clog << "wrong proposal packed sign" << std::endl;
-    return false;
-  }
-  if (expectedProposalSigner != -1) {
-    rc = secp256k1_ecdsa_verify(secpCtx, &sig, receivedProposalHash,
-                                &publicKeys[expectedProposalSigner]);
-    if (!rc) {
-      std::clog << "wrong proposal sign" << std::endl;
-      return false;
-    }
-  }
-  return true;
-}
-
-std::vector<uint16_t> ZyzaCommon::getProposalCancelers(const uint8_t *proposalHash) {
-  std::vector<uint16_t> keepers(cancelersPerProposal);
-  uint8_t h[2][32];
-  memcpy(h[0], proposalHash, 32);
-  for (int i = 0; i < cancelersPerProposal; ++i) {
-    uint8_t *src = h[i % 2];
-    uint8_t *dst = h[(i + 1) % 2];
-    SHA256(src, 32, dst);
-    keepers[i] = ((dst[1] << 8) | dst[0]) % nodesCount;
-  }
-  return std::move(keepers);
-}
-
 void ZyzaCommon::hexdump(const uint8_t *arr, const char *note) {
   std::stringstream ss;
   for (int i = 0; i < 32; ++i) {
@@ -158,5 +26,79 @@ void ZyzaCommon::hexdump(const void *arr, size_t size) {
     std::clog << (int)ptr[i];
   }
   std::clog << std::dec << std::endl;
+}
+
+static std::mt19937_64 engine;
+
+void ZyzaCommon::fillRandom(void *data, size_t size) {
+  auto *d = static_cast<uint64_t *>(data);
+  while (size >= 8) {
+    *d = engine();
+    size -= 8;
+    d++;
+  }
+  if (size > 0) {
+    auto val = engine();
+    memcpy(static_cast<void *>(d), &val, size);
+  }
+}
+
+ZyzaCommon::ZyzaCommon(int nodesCount,
+                       std::vector<std::vector<uint8_t>> &serializedPublicKeys)
+    : nodesCount(nodesCount), quorumSize(nodesCount - nodesCount / 3),
+      publicKeys(nodesCount) {
+  for (size_t i = 0; i < publicKeys.size(); i++) {
+    auto rc = secp256k1_ec_pubkey_parse(
+        secp256k1_context_static, &publicKeys[i],
+        serializedPublicKeys[i].data(), serializedPublicKeys[i].size());
+    assert(rc);
+  }
+}
+
+bool ZyzaCommon::verifyData(const capnp::Data::Reader &data,
+                            const proto::Signature::Reader &signature) {
+  if (data.size() == 0) {
+    std::clog << "empty data" << std::endl;
+    return false;
+  }
+  if (signature.getIdx() >= nodesCount) {
+    std::clog << "wrong signer idx" << std::endl;
+    return false;
+  }
+  if (signature.getSign().size() != 64) {
+    std::clog << "wrong signature size" << std::endl;
+  }
+  uint8_t hash[32];
+  SHA256(data.begin(), data.size(), hash);
+  return verifyData(hash, signature.getSign().begin(), signature.getIdx());
+}
+
+bool ZyzaCommon::verifySignedMessage(
+    const proto::SignedMessage::Reader &signedMessage) {
+  return verifyData(signedMessage.getBody(), signedMessage.getSign());
+}
+
+bool ZyzaCommon::verifyData(const uint8_t *hash, const uint8_t *sign,
+                            int signer) {
+  secp256k1_ecdsa_signature sig;
+  int rc = secp256k1_ecdsa_signature_parse_compact(secp256k1_context_static,
+                                                   &sig, sign);
+  if (rc != 1) {
+    std::clog << "wrong packed sign" << std::endl;
+    return false;
+  }
+  rc = secp256k1_ecdsa_verify(secp256k1_context_static, &sig, hash,
+                              &publicKeys[signer]);
+  if (rc != 1) {
+    std::clog << "wrong proposal sign" << std::endl;
+    return false;
+  }
+  return true;
+}
+void ZyzaCommon::hexdump(const proto::SignedMessage::Reader &message,
+                         const char *note) {
+  uint8_t hash[32];
+  SHA256(message.getBody().begin(), message.getBody().size(), hash);
+  hexdump(hash, note);
 }
 } // namespace zyza

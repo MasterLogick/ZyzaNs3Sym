@@ -13,6 +13,8 @@ public:
 
   void run();
 
+  void stop();
+
   ~Endpoint();
 
 protected:

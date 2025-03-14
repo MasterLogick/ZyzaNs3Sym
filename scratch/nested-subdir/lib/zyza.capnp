@@ -13,6 +13,11 @@ struct SignedMessage {
     sign @1 :Signature;
 }
 
+struct AckList {
+    proposalHash @0 :Data;
+    acknowledgements1 @1 :List(Signature);
+}
+
 struct Request {
     impl @0 :Data;
     id @1 :UInt64;
@@ -24,25 +29,36 @@ struct Redirect {
     redirect @0 :UInt16;
 }
 
-struct ResponseBody {
-    impl @0 :Data;
-    id @1 :UInt64;
+struct ResponseProofBody {
+    id @0 :UInt64;
+    implHash @1 :Data;
     proposalHash @2 :Data;
+}
+
+struct Response {
+    impl @0 :Data;
+    proof @1 :SignedMessage; #SignedMessage<ResponseProofBody>
 }
 
 struct ClientResponse {
     id @0 :UInt64;
-    proposalHash @1 :Data;
     union {
-        completed @2 :List(Signature);
-        canceled @3 :Bool;
+        completed @1 :Completed;
+        canceled @2 :Canceled;
+    }
+    struct Completed {
+        proofBody @0 :Data; # Data<ResponseProofBody>
+        proof @1 :List(Signature);
+    }
+    struct Canceled {
+        backupLeader @0 :UInt16;
+        proof @1 :List(Signature);
     }
 }
 
 struct RequestCancelBody {
     id @0 :UInt64;
-    proposalHash @1 :Data;
-    alertListHash @2 :Data;
+    backupLeader @1 :UInt16;
 }
 
 struct ProposalBody {
@@ -52,37 +68,35 @@ struct ProposalBody {
 }
 
 struct Proposal {
-    signedProposal @0 :Data;
-    acknowledgements @1 :List(List(Signature));
+    signedProposal @0 :Data; # Data<SignedMessage<ProposalBody>>
+    acknowledgements2 @1 :List(List(Signature));
 }
 
 struct Acknowledgement {
-    proposalHash @0 :Data;
+    hash @0 :Data;
     sign @1 :Signature;
 }
 
 struct FallbackAlertBody {
     lastAckedProposalHash @0 :Data;
-    unackedSignedProposals @1 :List(Data);
+    unackedSignedProposals @1 :List(Data); # List(Data<SignedMessage<ProposalBody>>)
+    union {
+        lastAckList @2 :AckList;
+        noAckList @3 :Void;
+    }
 }
 
-struct AlertList {
-    alerts @0 :List(SignedMessage);
+struct RecoveryStateBody {
+    alerts @0 :List(SignedMessage); # List(SignedMessage<FallbackAlertBody>)
 }
 
-struct ProposalCancelResponseBody {
-    proposalHash @0 :Data;
-    clientResponses @1 :List(ClientResponse);
+struct ClientResponsesBody {
+    recoveryStateBodyHash @0 :Data;
+    responses @1 :List(ClientResponse);
 }
 
 struct RecoveryBody {
-    alerts @0 :AlertList;
-    proposalCancelResponses @1 :List(List(SignedMessage));
-}
-
-struct RecoveryAck {
-    recoveryHash @0 :Data;
-    sign @1 :Signature;
+    clientResponses @0 :List(SignedMessage); # List(SignedMessage<ClientResponsesBody>)
 }
 
 struct ResendChainRequest {
@@ -91,6 +105,7 @@ struct ResendChainRequest {
 }
 
 struct ResendChainResponse {
-    proposals @0 :List(Data);
-    acknowledgements @1 :List(List(Signature));
+    proposals @0 :List(Data); # List(Data<SignedMessage<ProposalBody>>)
+    acknowledgements1 @1 :List(AckList);
+    acknowledgements2 @2 :List(List(Signature));
 }
