@@ -5,8 +5,8 @@ include(FetchContent)
 
 FetchContent_Declare(
         CapnProto
-        GIT_REPOSITORY https://github.com/capnproto/capnproto.git
-        GIT_TAG 1a0e12c0a3ba1f0dbbad45ddfef555166e0a14fc # tag: v1.0.2
+        GIT_REPOSITORY https://github.com/MasterLogick/capnproto.git
+        GIT_TAG 40e872f05db3656c6a40b6cc0a05f9af4b3c9135 # tag: v1.0.2
         GIT_SHALLOW TRUE
 )
 set(SECP256K1_BUILD_BENCHMARK OFF)
@@ -55,7 +55,7 @@ target_include_directories(zyza PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
 
 # Link the custom library to the scratch executable
 build_exec(
-        EXECNAME scratch-zyza-sim
+        EXECNAME zyza-sim
         SOURCE_FILES main.cc ZyzaInfiniteClient.cpp
         LIBRARIES_TO_LINK zyza
         ${libcore} ${libinternet} ${libapplications} ${libcsma} ${libpoint-to-point} ${libpoint-to-point-layout}

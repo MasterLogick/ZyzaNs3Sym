@@ -5,6 +5,7 @@
 #include "Endpoint.h"
 #include "MessageHeader.h"
 #include "MessageType.h"
+#include "TypedMallocMessageBuilder.h"
 #include "ZyzaCommon.h"
 #include "lib/zyza.capnp.h"
 #include "ns3/applications-module.h"
@@ -56,7 +57,8 @@ private:
 
   void processClientResponse(const proto::ClientResponse::Reader &reader);
 
-  void processClientResponses(const proto::SignedMessage::Reader &reader);
+  void processClientResponses(
+      const proto::SignedMessage<proto::ClientResponsesBody>::Reader &reader);
 
   void processProposal(const proto::Proposal::Reader &proposal);
 
@@ -64,11 +66,16 @@ private:
 
   void processAcknowledgement2(const proto::Acknowledgement::Reader &ack);
 
-  void processFallbackAlert(const proto::SignedMessage::Reader &fallbackAlert);
+  void processFallbackAlert(
+      const proto::SignedMessage<proto::FallbackAlertBody>::Reader
+          &fallbackAlert);
 
-  void processRecoveryState(const proto::SignedMessage::Reader &recoveryState);
+  void processRecoveryState(
+      const proto::SignedMessage<proto::RecoveryStateBody>::Reader
+          &recoveryState);
 
-  void processRecovery(const proto::SignedMessage::Reader &recovery);
+  void processRecovery(
+      const proto::SignedMessage<proto::RecoveryBody>::Reader &recovery);
 
   void processResendChainRequest(const proto::ResendChainRequest::Reader &nsr);
 
@@ -102,7 +109,8 @@ private:
     uint8_t proposalHash[32];
     std::map<uint16_t, uint8_t[64]> acks1;
     std::map<uint16_t, uint8_t[64]> acks2;
-    std::vector<uint8_t> proposal;
+    TypedMallocMessageBuilder<proto::SignedMessage<proto::ProposalBody>>
+        proposal;
     Proposal() = default;
     Proposal(Proposal &&m) = default;
   };
@@ -118,8 +126,10 @@ private:
   void sendAck2(const Proposal &proposal);
 
   void appendTail(
-      capnp::List<capnp::Data>::Reader::Iterator proposalsIt,
-      capnp::List<capnp::Data>::Reader::Iterator proposalsEnd,
+      capnp::List<proto::SignedMessage<proto::ProposalBody>>::Reader::Iterator
+          proposalsIt,
+      capnp::List<proto::SignedMessage<proto::ProposalBody>>::Reader::Iterator
+          proposalsEnd,
       capnp::List<proto::AckList>::Reader::Iterator acks1It,
       capnp::List<proto::AckList>::Reader::Iterator acks1End,
       capnp::List<capnp::List<proto::Signature>>::Reader::Iterator acks2It,
@@ -137,12 +147,13 @@ private:
 
   void sendPendingNodeMessages(int i);
 
-  void createSignedMessage(capnp::MallocMessageBuilder &body,
-                           capnp::MallocMessageBuilder &message);
+  void
+  signMessage(proto::SignedMessage<capnp::AnyPointer>::Builder unsignedMessage);
 
-  bool validateProposal(const proto::SignedMessage::Reader &proposal,
-                        const uint8_t *expectedPrevProposalHash,
-                        int expectedProposalSigner, int proposalIndex);
+  bool validateProposal(
+      const proto::SignedMessage<proto::ProposalBody>::Reader &proposal,
+      const uint8_t *expectedPrevProposalHash, int expectedProposalSigner,
+      int proposalIndex);
 
   bool
   validateSignatureList(const uint8_t *proposalHash,
@@ -151,15 +162,15 @@ private:
   bool
   validateResendChainResponse(const proto::ResendChainResponse::Reader &nsr);
 
-  bool validateFallbackAlert(const proto::SignedMessage::Reader &fallbackAlert);
+  bool validateFallbackAlert(
+      const proto::SignedMessage<proto::FallbackAlertBody>::Reader
+          &fallbackAlert);
 
   bool
   validateClientResponse(const proto::ClientResponse::Reader &clientResponse);
 
   bool validateClientResponses(
       const proto::ClientResponsesBody::Reader &clientResponsesBody);
-
-  void signData(const uint8_t *data, size_t size, uint8_t *result);
 
   void signData(const uint8_t *hash, uint8_t *result);
 
@@ -180,19 +191,23 @@ private:
   ns3::EventId nextLeaderAlertTimerEvent;
 
   // leader node fallback path variables
-  std::map<uint16_t, std::unique_ptr<capnp::MallocMessageBuilder>>
+  std::map<uint16_t, TypedMallocMessageBuilder<
+                         proto::SignedMessage<proto::FallbackAlertBody>>>
       acceptedFallbackAlerts;
-  std::map<uint16_t, std::unique_ptr<capnp::MallocMessageBuilder>>
+  std::map<uint16_t, TypedMallocMessageBuilder<
+                         proto::SignedMessage<proto::ClientResponsesBody>>>
       backupNodesClientResponses;
 
   // leader node fast path variables
-  std::vector<std::unique_ptr<capnp::MallocMessageBuilder>> pendingRequests;
+  std::vector<TypedMallocMessageBuilder<proto::Request>> pendingRequests;
 
   // common fallback path variables
   std::set<uint64_t> expectedClientResponses;
   uint8_t recoveryStateBodyHash[32];
-  std::unique_ptr<capnp::MallocMessageBuilder> recoveryStateBuilder;
-  std::map<uint64_t, std::unique_ptr<capnp::MallocMessageBuilder>>
+  TypedMallocMessageBuilder<proto::SignedMessage<proto::RecoveryStateBody>>
+      recoveryStateBuilder;
+  bool hasRecoveryState;
+  std::map<uint64_t, TypedMallocMessageBuilder<proto::ClientResponse>>
       clientResponses;
 
   // common variables
@@ -202,7 +217,8 @@ private:
     LEADER_FAST = 3,
     LEADER_FALLBACK = 4
   } currentState;
-  std::map<uint16_t, std::vector<std::pair<std::unique_ptr<char[]>, uint32_t>>>
+  std::map<uint16_t,
+           std::vector<std::pair<std::unique_ptr<uint8_t[]>, uint32_t>>>
       pendingNodeMessages;
   bool initPassed;
   std::list<Proposal> acceptedChain;

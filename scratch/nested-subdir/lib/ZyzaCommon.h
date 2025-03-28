@@ -18,8 +18,17 @@ public:
 
   static void hexdump(const void *arr, size_t size);
 
-  static void hexdump(const proto::SignedMessage::Reader &message,
+  static void hexdump(const capnp::AnyPointer::Reader &message,
                       const char *note);
+
+  static void hexdump(const capnp::AnyStruct::Reader &message,
+                      const char *note);
+
+  static void hashStruct(const capnp::AnyPointer::Reader &data,
+                         std::span<uint8_t, 32> hash32);
+
+  static void hashStruct(const capnp::AnyStruct::Reader &data,
+                         std::span<uint8_t, 32> hash32);
 
   static void fillRandom(void *data, size_t size);
 
@@ -27,10 +36,11 @@ protected:
   ZyzaCommon(int nodesCount,
              std::vector<std::vector<uint8_t>> &serializedPublicKeys);
 
-  bool verifyData(const capnp::Data::Reader &data,
+  bool verifyData(const capnp::AnyPointer::Reader &data,
                   const proto::Signature::Reader &signature);
 
-  bool verifySignedMessage(const proto::SignedMessage::Reader &signedMessage);
+  bool verifySignedMessage(
+      const proto::SignedMessage<capnp::AnyPointer>::Reader &signedMessage);
 
   bool verifyData(const uint8_t *hash, const uint8_t *sign, int signer);
 

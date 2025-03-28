@@ -2,6 +2,7 @@
 
 #include "../../src/internet/model/tcp-socket-factory.h"
 #include "capnp/message.h"
+#include "capnp/serialize-packed.h"
 #include "capnp/serialize.h"
 #include "lib/zyza.capnp.h"
 
@@ -72,13 +73,12 @@ void ZyzaClientRequest::onUdpMessage(std::span<const uint8_t> message) {
             << "c: client got message: "
             << messageTypeToString(
                    static_cast<MessageType>(header->messageType))
-            << " from " << header->senderIdx << ": " << std::hex
-            << header->msgId << std::dec << std::endl;
+            << " of size " << message.size() << " from " << header->senderIdx
+            << ": " << std::hex << header->msgId << std::dec << std::endl;
   auto content = message.subspan<sizeof(MessageHeader)>();
   assert(header->messageSize == message.size());
-  capnp::FlatArrayMessageReader responseReader(
-      {reinterpret_cast<const capnp::word *>(content.data()),
-       content.size() / 8});
+  kj::ArrayInputStream ais({content.data(), content.size()});
+  capnp::PackedMessageReader responseReader(ais);
   if (static_cast<MessageType>(header->messageType) == MessageType::RESPONSE) {
     processResponse(responseReader.getRoot<proto::Response>());
   } else if (static_cast<MessageType>(header->messageType) ==
@@ -86,7 +86,9 @@ void ZyzaClientRequest::onUdpMessage(std::span<const uint8_t> message) {
     processRedirect(responseReader.getRoot<proto::Redirect>());
   } else if (static_cast<MessageType>(header->messageType) ==
              MessageType::REQUEST_CANCEL) {
-    processRequestCancel(responseReader.getRoot<proto::SignedMessage>());
+    processRequestCancel(
+        responseReader
+            .getRoot<proto::SignedMessage<proto::RequestCancelBody>>());
   }
 }
 
@@ -101,21 +103,26 @@ void ZyzaClientRequest::sendToNode(int node, MessageType messageType,
                                    capnp::MessageBuilder &message) {
   uint64_t msgId = 0;
   fillRandom(&msgId, sizeof(msgId));
-  uint32_t size =
-      capnp::computeSerializedSizeInWords(message) * 8 + sizeof(MessageHeader);
-  auto data = std::make_unique<uint8_t[]>(size);
-  new (data.get()) MessageHeader(size, static_cast<uint16_t>(0xffff),
-                                 static_cast<uint16_t>(messageType), msgId);
+  auto unpackedBytes = capnp::computeSerializedSizeInWords(message) * 8;
+  // max compression overhead is 2 bytes per 2KB
+  auto maxPackedBytes = ((unpackedBytes + 2048 - 1) / 2048) * (2048 + 2);
+  uint32_t maxSize = maxPackedBytes + sizeof(MessageHeader);
+  auto data = std::make_unique<uint8_t[]>(maxSize);
   kj::ArrayOutputStream aos(
-      {data.get() + sizeof(MessageHeader), size - sizeof(MessageHeader)});
-  capnp::writeMessage(aos, message);
+      {data.get() + sizeof(MessageHeader), maxPackedBytes});
+  capnp::writePackedMessage(aos, message);
+  auto compressedMsgSize =
+      aos.getWriteBuffer().begin() - (data.get() + sizeof(MessageHeader));
+  auto realMsgSize = compressedMsgSize + sizeof(MessageHeader);
+  new (data.get()) MessageHeader(realMsgSize, static_cast<uint16_t>(0xffff),
+                                 static_cast<uint16_t>(messageType), msgId);
   ns3::Address address(
       ns3::InetSocketAddress(p2psh.GetSpokeIpv4Address(node), 1235));
   std::clog << ns3::Simulator::Now().As() << ": " << clientId << "c: sending "
             << messageTypeToString(static_cast<MessageType>(messageType))
-            << " to " << node << ": " << std::hex << msgId << std::dec
-            << std::endl;
-  serverUdpSocket->SendTo(data.get(), size, 0, address);
+            << " of size " << realMsgSize << " to " << node << ": " << std::hex
+            << msgId << std::dec << std::endl;
+  serverUdpSocket->SendTo(data.get(), realMsgSize, 0, address);
 }
 
 void ZyzaClientRequest::processResponse(
@@ -124,15 +131,10 @@ void ZyzaClientRequest::processResponse(
     std::clog << "duplicate response" << std::endl;
     return;
   }
-  if (!verifySignedMessage(response.getProof())) {
+  if (!verifySignedMessage(response.getProof().asGeneric())) {
     return;
   }
-  capnp::FlatArrayMessageReader responseProofReader(
-      {reinterpret_cast<const capnp::word *>(
-           response.getProof().getBody().begin()),
-       response.getProof().getBody().size() / 8});
-  auto responseProofBody =
-      responseProofReader.getRoot<proto::ResponseProofBody>();
+  auto responseProofBody = response.getProof().getBody();
   if (responseProofBody.getId() != reqId) {
     std::clog << "wrong request id" << std::endl;
     return;
@@ -152,8 +154,7 @@ void ZyzaClientRequest::processResponse(
     return;
   }
   uint8_t proofHash[32];
-  SHA256(response.getProof().getBody().begin(),
-         response.getProof().getBody().size(), proofHash);
+  hashStruct(response.getProof().asGeneric().getBody(), proofHash);
   auto &resp = pendingQc[response.getProof().getSign().getIdx()];
   memcpy(resp.proofHash, proofHash, 32);
   memcpy(resp.sign, response.getProof().getSign().getSign().begin(), 64);
@@ -203,16 +204,14 @@ void ZyzaClientRequest::processRedirect(
             << std::endl;
   sendRequestToNode();
 }
+
 void ZyzaClientRequest::processRequestCancel(
-    const proto::SignedMessage::Reader &signedMessage) {
-  if (!verifySignedMessage(signedMessage)) {
+    const proto::SignedMessage<proto::RequestCancelBody>::Reader
+        &signedMessage) {
+  if (!verifySignedMessage(signedMessage.asGeneric())) {
     return;
   }
-  capnp::FlatArrayMessageReader requestCancelBodyReader(
-      {reinterpret_cast<const capnp::word *>(signedMessage.getBody().begin()),
-       signedMessage.getBody().size() / 8});
-  auto requestCancelBody =
-      requestCancelBodyReader.getRoot<proto::RequestCancelBody>();
+  auto requestCancelBody = signedMessage.getBody();
   if (requestCancelBody.getId() != reqId) {
     std::clog << "wrong request cancel request id" << std::endl;
     return;

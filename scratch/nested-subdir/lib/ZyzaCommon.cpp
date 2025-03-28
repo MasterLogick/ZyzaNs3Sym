@@ -4,11 +4,9 @@
 #include <capnp/serialize.h>
 #include <cassert>
 #include <iostream>
-#include <list>
 #include <openssl/sha.h>
 #include <random>
 #include <sstream>
-#include <sys/random.h>
 
 namespace zyza {
 void ZyzaCommon::hexdump(const uint8_t *arr, const char *note) {
@@ -55,12 +53,8 @@ ZyzaCommon::ZyzaCommon(int nodesCount,
   }
 }
 
-bool ZyzaCommon::verifyData(const capnp::Data::Reader &data,
+bool ZyzaCommon::verifyData(const capnp::AnyPointer::Reader &data,
                             const proto::Signature::Reader &signature) {
-  if (data.size() == 0) {
-    std::clog << "empty data" << std::endl;
-    return false;
-  }
   if (signature.getIdx() >= nodesCount) {
     std::clog << "wrong signer idx" << std::endl;
     return false;
@@ -69,12 +63,12 @@ bool ZyzaCommon::verifyData(const capnp::Data::Reader &data,
     std::clog << "wrong signature size" << std::endl;
   }
   uint8_t hash[32];
-  SHA256(data.begin(), data.size(), hash);
+  hashStruct(data, hash);
   return verifyData(hash, signature.getSign().begin(), signature.getIdx());
 }
 
 bool ZyzaCommon::verifySignedMessage(
-    const proto::SignedMessage::Reader &signedMessage) {
+    const proto::SignedMessage<capnp::AnyPointer>::Reader &signedMessage) {
   return verifyData(signedMessage.getBody(), signedMessage.getSign());
 }
 
@@ -95,10 +89,33 @@ bool ZyzaCommon::verifyData(const uint8_t *hash, const uint8_t *sign,
   }
   return true;
 }
-void ZyzaCommon::hexdump(const proto::SignedMessage::Reader &message,
+
+void ZyzaCommon::hexdump(const capnp::AnyPointer::Reader &message,
                          const char *note) {
   uint8_t hash[32];
-  SHA256(message.getBody().begin(), message.getBody().size(), hash);
+  hashStruct(message, hash);
   hexdump(hash, note);
+}
+
+void ZyzaCommon::hexdump(const capnp::AnyStruct::Reader &message,
+                         const char *note) {
+  uint8_t hash[32];
+  hashStruct(message, hash);
+  hexdump(hash, note);
+}
+
+void ZyzaCommon::hashStruct(const capnp::AnyPointer::Reader &data,
+                            std::span<uint8_t, 32> hash32) {
+  capnp::MallocMessageBuilder builder;
+  builder.setRoot(data);
+  auto flatBody = capnp::messageToFlatArray(builder);
+  SHA256(flatBody.asBytes().begin(), flatBody.asBytes().size(), hash32.data());
+}
+void ZyzaCommon::hashStruct(const capnp::AnyStruct::Reader &data,
+                            std::span<uint8_t, 32> hash32) {
+  capnp::MallocMessageBuilder builder;
+  builder.setRoot(data);
+  auto flatBody = capnp::messageToFlatArray(builder);
+  SHA256(flatBody.asBytes().begin(), flatBody.asBytes().size(), hash32.data());
 }
 } // namespace zyza

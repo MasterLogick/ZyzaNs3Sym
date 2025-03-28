@@ -50,7 +50,7 @@ private:
 
   void processRedirect(const proto::Redirect::Reader &redirect);
 
-  void processRequestCancel(const proto::SignedMessage::Reader &signedMessage);
+  void processRequestCancel(const proto::SignedMessage<proto::RequestCancelBody>::Reader &signedMessage);
 
   std::string host;
   uint64_t reqId;

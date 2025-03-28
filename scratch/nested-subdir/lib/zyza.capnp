@@ -8,8 +8,8 @@ struct Signature {
     sign @1 :Data;
 }
 
-struct SignedMessage {
-    body @0 :Data;
+struct SignedMessage(T) {
+    body @0 :T;
     sign @1 :Signature;
 }
 
@@ -37,7 +37,7 @@ struct ResponseProofBody {
 
 struct Response {
     impl @0 :Data;
-    proof @1 :SignedMessage; #SignedMessage<ResponseProofBody>
+    proof @1 :SignedMessage(ResponseProofBody);
 }
 
 struct ClientResponse {
@@ -47,7 +47,7 @@ struct ClientResponse {
         canceled @2 :Canceled;
     }
     struct Completed {
-        proofBody @0 :Data; # Data<ResponseProofBody>
+        proofBody @0 :ResponseProofBody;
         proof @1 :List(Signature);
     }
     struct Canceled {
@@ -68,7 +68,7 @@ struct ProposalBody {
 }
 
 struct Proposal {
-    signedProposal @0 :Data; # Data<SignedMessage<ProposalBody>>
+    signedProposal @0 :SignedMessage(ProposalBody);
     acknowledgements2 @1 :List(List(Signature));
 }
 
@@ -79,7 +79,7 @@ struct Acknowledgement {
 
 struct FallbackAlertBody {
     lastAckedProposalHash @0 :Data;
-    unackedSignedProposals @1 :List(Data); # List(Data<SignedMessage<ProposalBody>>)
+    unackedSignedProposals @1 :List(SignedMessage(ProposalBody));
     union {
         lastAckList @2 :AckList;
         noAckList @3 :Void;
@@ -87,7 +87,7 @@ struct FallbackAlertBody {
 }
 
 struct RecoveryStateBody {
-    alerts @0 :List(SignedMessage); # List(SignedMessage<FallbackAlertBody>)
+    alerts @0 :List(SignedMessage(FallbackAlertBody));
 }
 
 struct ClientResponsesBody {
@@ -96,7 +96,7 @@ struct ClientResponsesBody {
 }
 
 struct RecoveryBody {
-    clientResponses @0 :List(SignedMessage); # List(SignedMessage<ClientResponsesBody>)
+    clientResponses @0 :List(SignedMessage(ClientResponsesBody));
 }
 
 struct ResendChainRequest {
@@ -105,7 +105,7 @@ struct ResendChainRequest {
 }
 
 struct ResendChainResponse {
-    proposals @0 :List(Data); # List(Data<SignedMessage<ProposalBody>>)
+    proposals @0 :List(SignedMessage(ProposalBody));
     acknowledgements1 @1 :List(AckList);
     acknowledgements2 @2 :List(List(Signature));
 }

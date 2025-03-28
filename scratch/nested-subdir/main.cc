@@ -82,7 +82,7 @@ int main(int argc, char *argv[]) {
     Ptr<zyza::ZyzaReplica> app = CreateObject<zyza::ZyzaReplica>(
         n, i, p2psh, pubKeys,
         std::span<const uint8_t>{privKeys[i].begin(), privKeys[i].end()},
-        std::chrono::milliseconds(1400), std::chrono::milliseconds(2000), 8);
+        std::chrono::milliseconds(1400), std::chrono::milliseconds(5000), 8);
     p2psh.GetSpokeNode(i)->AddApplication(app);
     app->SetStartTime(Seconds(0));
     app->SetStopTime(Seconds(2000));
@@ -92,7 +92,7 @@ int main(int argc, char *argv[]) {
   }
   for (int i = 0; i < c; ++i) {
     Ptr<ZyzaInfiniteClient> app = CreateObject<ZyzaInfiniteClient>(
-        i, n, pubKeys, p2psh, std::chrono::milliseconds(900));
+        i, n, pubKeys, p2psh, std::chrono::milliseconds(5000));
     p2psh.GetSpokeNode(n + i)->AddApplication(app);
     app->SetStartTime(Seconds(0));
     app->SetStopTime(Seconds(2000));
